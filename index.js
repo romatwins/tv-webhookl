@@ -10,7 +10,7 @@ app.get("/test", (req, res) => {
   res.json({ status: "ok", message: "Webhook active and reachable" });
 });
 
-// Основной webhook-маршрут
+// Основной webhook
 app.post("/", (req, res) => {
   console.log("Received data:", req.body);
   res.json({ status: "success", received: req.body });
