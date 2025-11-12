@@ -2,7 +2,17 @@ import express from "express";
 import bodyParser from "body-parser";
 
 const app = express();
-const port = process.env.PORT || 10000;
+app.use(bodyParser.json());
+
+app.get("/test", (req, res) => res.json({ ok: true, endpoint: "/test", ts: Date.now() }));
+
+app.post("/", (req, res) => {
+  console.log("Received payload:", req.body);
+  res.json({ ok: true, received: req.body });
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Webhook started on port ${PORT}`));
 
 // читаем секрет из окружения
 const SHARED_SECRET = process.env.SHARED_SECRET;
