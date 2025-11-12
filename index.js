@@ -4,40 +4,27 @@ import morgan from "morgan";
 const app = express();
 const port = process.env.PORT || 10000;
 
-// Middleware
+// лог и парсер
 app.use(morgan("tiny"));
 app.use(express.json());
 
-// Health-check и быстрая проверка
+// корневой healthcheck (браузер)
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "tv-webhook",
-    ts: new Date().toISOString()
-  });
+  res.json({ ok: true, service: "tv-webhook", ts: new Date().toISOString() });
 });
 
-// Тестовый маршрут
+// тестовый путь (браузер)
 app.get("/test", (req, res) => {
   res.json({ status: "ok", endpoint: "/test", ts: Date.now() });
 });
 
-// Основной webhook — оставляю оба пути для удобства
+// основной webhook (принимает POST от TradingView)
 app.post("/", (req, res) => {
-  console.log("POST / payload:", req.body);
+  console.log("Received data:", req.body);
   res.json({ status: "success", received: req.body });
 });
 
-app.post("/hook", (req, res) => {
-  console.log("POST /hook payload:", req.body);
-  res.json({ status: "success", received: req.body });
-});
-
-// 404 на всё остальное — чтобы видеть точный путь
-app.use((req, res) => {
-  res.status(404).json({ ok: false, message: "Route not found", path: req.path });
-});
-
+// старт
 app.listen(port, () => {
   console.log(`Webhook started on port ${port}`);
 });
