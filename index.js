@@ -72,6 +72,33 @@ app.get("/env", (_req, res) => {
   });
 });
 
+// Диагностика RPC + кошелька (для быстрой проверки)
+app.get("/diag", async (_req, res) => {
+  try {
+    const provider = getProvider(8453);
+    const wallet   = getWallet(provider);
+    const address  = await wallet.getAddress();
+    const [blockNumber, balance] = await Promise.all([
+      provider.getBlockNumber(),
+      provider.getBalance(address),
+    ]);
+
+    res.json({
+      ok: true,
+      chainId: 8453,
+      blockNumber,
+      wallet: address,
+      balanceWei: balance.toString(),
+      DRY_RUN,
+      rpcBaseConfigured: !!RPCS[8453],
+      HAS_SHARED_SECRET: !!SHARED_SECRET,
+      HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Вернёт адрес кошелька (удобно проверить правильность PRIVATE_KEY)
 app.get("/addr", async (_req, res) => {
   try {
@@ -144,7 +171,7 @@ app.post("/", async (req, res) => {
 
     // LIVE-режим: здесь должен быть реальный свап.
     // Пока что просто подтверждаем, что live включён.
-    const { secret: _omit, ...clean } = p;
+    const { secret: _omit2, ...clean } = p;
     console.log("Signal accepted (live)", {
       side: clean.side, chainId: clean.chainId,
       src: clean.srcToken, dst: clean.dstToken,
@@ -163,7 +190,7 @@ app.post("/", async (req, res) => {
 
 // ---- Start ----
 app.listen(PORT, () => {
-  // Стартовая диагностика: чётко видно, что видит процесс
+  // Стартовая диагностика: видно, что видит процесс
   console.log(`Webhook started on port ${PORT}`);
   console.log("ENV check:", {
     DRY_RUN,
