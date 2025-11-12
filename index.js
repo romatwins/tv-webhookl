@@ -1,24 +1,21 @@
-import express from "express";
-import morgan from "morgan";
-import dotenv from "dotenv";
-dotenv.config();
-
+const express = require("express");
+const bodyParser = require("body-parser");
 const app = express();
-app.use(morgan("combined"));
-app.use(express.json({ limit: "200kb" }));
+const port = process.env.PORT || 10000;
 
-app.get("/", (_req, res) => res.status(200).send("OK"));
+app.use(bodyParser.json());
 
-app.post("/hook", (req, res) => {
-  const p = req.body || {};
-  if (!p.secret || p.secret !== process.env.SHARED_SECRET) {
-    return res.status(403).json({ ok:false, error:"Bad secret" });
-  }
-
-  console.log("TV ALERT RECEIVED:", JSON.stringify(p));
-
-  return res.status(200).json({ ok:true });
+// Тестовый маршрут
+app.get("/test", (req, res) => {
+  res.json({ status: "ok", message: "Webhook active and reachable" });
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log("Webhook started on port", port));
+// Основной webhook-маршрут
+app.post("/", (req, res) => {
+  console.log("Received data:", req.body);
+  res.json({ status: "success", received: req.body });
+});
+
+app.listen(port, () => {
+  console.log(`Webhook started on port ${port}`);
+});
