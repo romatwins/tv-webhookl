@@ -24,18 +24,26 @@ app.get("/test", (req, res) => {
 
 // Основной webhook
 app.post("/", (req, res) => {
-  const headerSecret = req.header("X-Secret");
-  const bodySecret =
-    req.body?.secret || req.body?.SECRET || req.body?.sharedSecret;
+  try {
+    const secret = (req.body && req.body.secret) || "";
+    if (secret !== process.env.SHARED_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
 
-  const incoming = headerSecret ?? bodySecret ?? "";
+    // Сформируем объект без секрета для логов/дальнейшей обработки
+    const { secret: _omit, ...clean } = req.body;
 
-  if (incoming !== SHARED_SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+    // Короткая маска секрета в логах
+    const mask = secret.length >= 4 ? secret.slice(0,2) + "***" + secret.slice(-2) : "***";
+    console.log("Received payload:", { ...clean, secret: mask });
+
+    // TODO: здесь можно форвардить clean в биржу/бота/БД
+
+    res.json({ ok: true, received: clean });
+  } catch (e) {
+    console.error("Handler error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
-
-  console.log("Received payload:", JSON.stringify(req.body));
-  res.json({ ok: true, received: req.body });
 });
 
 app.listen(port, () => {
