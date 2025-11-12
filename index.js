@@ -7,12 +7,12 @@ dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 10000;
-const SHARED_SECRET = process.env.SHARED_SECRET;
+const SHARED_SECRET = process.env.SHARED_SECRET || "r6m1tw5ns"; // твой секрет по умолчанию
 
 app.use(bodyParser.json());
 app.use(morgan("combined"));
 
-// Healthcheck корень
+// Проверка доступности сервиса
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "tv-webhook", ts: new Date().toISOString() });
 });
@@ -25,10 +25,12 @@ app.get("/test", (req, res) => {
 // Основной webhook
 app.post("/", (req, res) => {
   const headerSecret = req.header("X-Secret");
-  const bodySecret = req.body?.secret || req.body?.SECRET || req.body?.sharedSecret;
+  const bodySecret =
+    req.body?.secret || req.body?.SECRET || req.body?.sharedSecret;
 
   const incoming = headerSecret ?? bodySecret ?? "";
-  if (!SHARED_SECRET || incoming !== SHARED_SECRET) {
+
+  if (incoming !== SHARED_SECRET) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 
