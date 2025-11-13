@@ -1,13 +1,12 @@
-// index.js: боевой ETH -> USDC через 0x на Base + диагностика и whitelist
+// index.js — боевой двухсторонний swap ETH⇄USDC через 0x с whitelist + safe-approve
 
 import express from "express";
 import bodyParser from "body-parser";
 import { JsonRpcProvider, Wallet, Contract } from "ethers";
 import fetch from "node-fetch";
 
-// ==== ENV ====
+// ===== ENV =====
 const PORT = process.env.PORT || 10000;
-
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY  || "").trim();
 const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
@@ -18,18 +17,18 @@ const RPCS = {
   42161:  (process.env.RPC_URL_ARB  || process.env.RPC_ARB  || "").trim(),
 };
 
-// Белый список кошельков и роутеров, через которые разрешено проводить сделки
+// ==== WHITELIST ====
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
-  .map(s => s.trim().toLowerCase())
+  .map(a => a.trim().toLowerCase())
   .filter(Boolean);
 
 const ROUTER_WHITELIST = (process.env.ROUTER_WHITELIST || "")
   .split(",")
-  .map(s => s.trim().toLowerCase())
+  .map(a => a.trim().toLowerCase())
   .filter(Boolean);
 
-// ==== Константы по Base ETH/USDC ====
+// ===== CONSTANTS =====
 const TOKENS = {
   ETH_ZERO:  "0x0000000000000000000000000000000000000000",
   ETH_EEEE:  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
@@ -38,320 +37,233 @@ const TOKENS = {
 
 const ZEROX_BASE_URL = "https://base.api.0x.org";
 
-// Минимальный ABI для ERC20, если потом будем трогать USDC
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
-  "function decimals() view returns (uint8)"
+  "function decimals() view returns (uint8)",
+  "function approve(address spender, uint256 amount) returns (bool)"
 ];
 
-// ==== App ====
-const app = express();
-app.use(bodyParser.json({ limit: "200kb", type: "application/json" }));
-app.use(bodyParser.text({ limit: "200kb", type: "*/*" }));
+// ===== HELPERS =====
 
-// Универсальный парсер TradingView
 function normalizeBody(raw) {
   if (raw == null) return null;
   if (typeof raw === "object") return raw;
   if (typeof raw === "string") {
-    const t = raw.trim();
-    try { return JSON.parse(t); } catch { return { _raw: t }; }
+    try { return JSON.parse(raw.trim()); }
+    catch { return { _raw: raw }; }
   }
   return { _raw: raw };
 }
 
-// Провайдер
 function getProvider(chainId) {
-  const url = RPCS[Number(chainId)];
+  const url = RPCS[chainId];
   if (!url) throw new Error(`RPC not configured for chainId ${chainId}`);
-  return new JsonRpcProvider(url, Number(chainId));
+  return new JsonRpcProvider(url, chainId);
 }
 
-// Кошелек
 function getWallet(provider) {
   if (!PRIVATE_KEY_RAW) throw new Error("PRIVATE_KEY is not set");
   const pk = PRIVATE_KEY_RAW.startsWith("0x") ? PRIVATE_KEY_RAW : "0x" + PRIVATE_KEY_RAW;
   return new Wallet(pk, provider);
 }
 
-// 90% баланса ETH
-async function getNinetyPercentEth(wallet) {
-  const addr = await wallet.getAddress();
-  const balance = await wallet.provider.getBalance(addr); // bigint
-  const ninety = balance * 90n / 100n;
-  if (ninety <= 0n) {
-    throw new Error("Not enough ETH balance for 90% calculation");
-  }
+function isEthLike(a) {
+  a = String(a || "").toLowerCase();
+  return (
+    a === TOKENS.ETH_ZERO.toLowerCase() ||
+    a === TOKENS.ETH_EEEE.toLowerCase()
+  );
+}
+
+// 90% ETH
+async function get90pctETH(wallet) {
+  const bal = await wallet.provider.getBalance(await wallet.getAddress());
+  const ninety = bal * 90n / 100n;
+  if (ninety <= 0n) throw new Error("ETH balance too low for 90%");
   return ninety;
 }
 
-// Проверка, что адрес похож на ETH-алиас
-function isEthLike(addr) {
-  const a = String(addr || "").toLowerCase();
-  return a === TOKENS.ETH_ZERO.toLowerCase()
-    || a === TOKENS.ETH_EEEE.toLowerCase();
+// 90% USDC
+async function get90pctUSDC(wallet, provider) {
+  const usdc = new Contract(TOKENS.USDC_BASE, ERC20_ABI, provider);
+  const bal = await usdc.balanceOf(await wallet.getAddress());
+  const ninety = bal * 90n / 100n;
+  if (ninety <= 0n) throw new Error("USDC balance too low for 90%");
+  return { usdc, ninety };
 }
 
-// ==== Health ====
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "tv-webhook", ts: new Date().toISOString() });
-});
+// ===== APP =====
+const app = express();
+app.use(bodyParser.json({ limit: "200kb" }));
+app.use(bodyParser.text({ type: "*/*" }));
 
-app.get("/test", (_req, res) => {
-  res.json({ ok: true, endpoint: "/test", ts: Date.now() });
-});
+// ===== DIAGNOSTICS =====
+app.get("/", (_req,res)=>res.json({ok:true,ts:new Date().toISOString()}));
+app.get("/test", (_req,res)=>res.json({ok:true}));
 
-app.get("/env", (_req, res) => {
+app.get("/env", (_req,res)=>{
   res.json({
-    ok: true,
+    ok:true,
     DRY_RUN,
-    RPCS: {
-      "1": !!RPCS[1],
-      "8453": !!RPCS[8453],
-      "42161": !!RPCS[42161],
-    },
-    RPC_URL_BASE: RPCS[8453] ? (RPCS[8453].slice(0, 32) + "...") : null,
-    HAS_SHARED_SECRET: !!SHARED_SECRET,
-    HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
-    WALLET_WHITELIST_SIZE: WALLET_WHITELIST.length,
-    ROUTER_WHITELIST_SIZE: ROUTER_WHITELIST.length
+    RPC_BASE: !!RPCS[8453],
+    HAS_SECRET: !!SHARED_SECRET,
+    HAS_KEY: !!PRIVATE_KEY_RAW,
+    WALLET_WHITELIST,
+    ROUTER_WHITELIST
   });
 });
 
-app.get("/diag", async (_req, res) => {
-  try {
-    const provider = getProvider(8453);
-    const wallet   = getWallet(provider);
-    const address  = await wallet.getAddress();
-    const [blockNumber, balance] = await Promise.all([
-      provider.getBlockNumber(),
-      provider.getBalance(address),
-    ]);
-
-    const whitelisted =
-      WALLET_WHITELIST.length === 0 ||
-      WALLET_WHITELIST.includes(address.toLowerCase());
-
-    res.json({
-      ok: true,
-      chainId: 8453,
-      blockNumber,
-      wallet: address,
-      balanceWei: balance.toString(),
-      DRY_RUN,
-      rpcBaseConfigured: !!RPCS[8453],
-      HAS_SHARED_SECRET: !!SHARED_SECRET,
-      HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
-      walletWhitelisted: whitelisted
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get("/addr", async (_req, res) => {
-  try {
+app.get("/diag", async (_req,res)=>{
+  try{
     const provider = getProvider(8453);
     const wallet = getWallet(provider);
-    const address = await wallet.getAddress();
-    res.json({ ok: true, address, chainId: 8453 });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+    const addr = await wallet.getAddress();
+    const balance = await provider.getBalance(addr);
+    res.json({
+      ok:true,
+      addr,
+      balanceWei: balance.toString(),
+      whitelisted: WALLET_WHITELIST.length === 0 || 
+                   WALLET_WHITELIST.includes(addr.toLowerCase())
+    });
+  }catch(e){res.status(500).json({ok:false,error:e.message})}
 });
 
-// ==== Основной приёмник сигналов ====
-app.post("/", async (req, res) => {
-  try {
-    const body = normalizeBody(req.body) || {};
+// ===== MAIN SWAP HANDLER =====
+app.post("/", async (req,res)=>{
+  try{
+    const p = normalizeBody(req.body);
+    if (!p) throw new Error("empty payload");
 
-    // Авторизация по секрету
-    const hdrSecret  = req.get("X-Secret") || req.get("x-secret") || "";
-    const bodySecret = typeof body.secret === "string" ? body.secret : "";
-    const provided   = hdrSecret || bodySecret;
-
-    if (!SHARED_SECRET) {
-      return res.status(500).json({ ok: false, error: "server_misconfigured_no_secret" });
-    }
+    // Secret
+    const hdrSec = req.get("X-Secret") || "";
+    const provided = hdrSec || p.secret;
     if (provided !== SHARED_SECRET) {
-      const mask = provided ? provided.slice(0,2) + "***" + provided.slice(-2) : "";
-      console.warn("Unauthorized payload", { provided: mask });
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+      return res.status(401).json({ok:false,error:"unauthorized"});
     }
 
-    // Валидация полей
-    const p = body;
-    const required = [
-      "action","side","chainId",
-      "srcToken","dstToken",
-      "amountMode","amountValue",
-      "slippageBps","deadlineSec",
+    // Validate
+    const fields = [
+      "action","side","chainId","srcToken","dstToken",
+      "amountMode","amountValue","slippageBps","deadlineSec",
       "symbol","tf","signalId"
     ];
-    const missing = required.filter(k => !(k in p));
+    const missing = fields.filter(f=>!(f in p));
     if (missing.length) {
-      console.warn("Invalid payload. Missing fields:", missing);
-      return res.status(400).json({ ok: false, error: "invalid_payload", missing });
+      return res.status(400).json({ok:false,error:"invalid payload",missing});
     }
 
-    if (String(p.amountMode) !== "exactIn") {
-      return res.status(400).json({ ok: false, error: "Only exactIn is supported now" });
-    }
+    const chainId = Number(p.chainId);
+    if (chainId !== 8453) throw new Error("Only Base chain supported");
 
-    // Поднимаем провайдер и кошелек
-    const provider = getProvider(p.chainId);
-    const wallet   = getWallet(provider);
-    const address  = await wallet.getAddress();
+    const provider = getProvider(chainId);
+    const wallet = getWallet(provider);
+    const addr = await wallet.getAddress();
 
-    if (
-      WALLET_WHITELIST.length > 0 &&
-      !WALLET_WHITELIST.includes(address.toLowerCase())
-    ) {
-      throw new Error("Wallet address is not in WALLET_WHITELIST");
-    }
+    if (WALLET_WHITELIST.length>0 &&
+        !WALLET_WHITELIST.includes(addr.toLowerCase()))
+      throw new Error("Wallet not whitelisted");
 
-    // DRY_RUN: только подпись, без сети
     if (DRY_RUN) {
-      let signedPreview = null;
-      try {
-        const msg = `tv-webhook dry-run ${p.signalId} ${Date.now()}`;
-        signedPreview = await wallet.signMessage(msg);
-      } catch (e) {
-        console.warn("Sign preview failed:", e.message);
-      }
-      const { secret: _omit, ...clean } = p;
-      console.log("Signal accepted (dry-run)", {
-        side: clean.side,
-        chainId: clean.chainId,
-        src: clean.srcToken,
-        dst: clean.dstToken,
-        amountMode: clean.amountMode,
-        amount: clean.amountValue,
-        addr: address,
-        dryRun: true
+      return res.json({ok:true,mode:"dry-run",addr,received:p});
+    }
+
+    const src = p.srcToken.toLowerCase();
+    const dst = p.dstToken.toLowerCase();
+
+    // ==== USDC → ETH ====
+    if (src === TOKENS.USDC_BASE.toLowerCase() && isEthLike(dst)) {
+
+      const { usdc, ninety } = await get90pctUSDC(wallet, provider);
+      const sellAmount = ninety;
+
+      const slippage = Number(p.slippageBps)/10_000;
+
+      const qs = new URLSearchParams({
+        sellToken: TOKENS.USDC_BASE,
+        buyToken: TOKENS.ETH_EEEE,
+        sellAmount: sellAmount.toString(),
+        takerAddress: addr,
+        slippagePercentage: slippage.toString()
       });
+
+      const r = await fetch(`${ZEROX_BASE_URL}/swap/v1/quote?${qs}`);
+      if (!r.ok) throw new Error("0x quote failed");
+      const quote = await r.json();
+
+      const router = quote.to.toLowerCase();
+      if (ROUTER_WHITELIST.length>0 &&
+          !ROUTER_WHITELIST.includes(router))
+        throw new Error("Router not whitelisted");
+
+      // Approve USDC
+      const approveTx = await usdc.connect(wallet).approve(router, sellAmount);
+      await approveTx.wait();
+
+      const tx = await wallet.sendTransaction({
+        to: quote.to,
+        data: quote.data,
+        value: 0n
+      });
+
       return res.json({
-        ok: true,
-        mode: "dry-run",
-        wallet: address,
-        received: clean,
-        signedPreview
+        ok:true,
+        mode:"live-sent-usdc-eth",
+        txHash: tx.hash,
+        router,
+        sellAmount: sellAmount.toString(),
+        buyAmount: quote.buyAmount
       });
     }
 
-    // ==== LIVE режим, только ETH -> USDC на Base через 0x ====
-    if (Number(p.chainId) !== 8453) {
-      throw new Error(`Only Base chainId 8453 is supported in live mode`);
-    }
+    // ==== ETH → USDC ====
+    if (isEthLike(src) && dst === TOKENS.USDC_BASE.toLowerCase()) {
 
-    const srcLower = String(p.srcToken || "").toLowerCase();
-    const dstLower = String(p.dstToken || "").toLowerCase();
+      const sellAmount = await get90pctETH(wallet);
+      const slippage = Number(p.slippageBps)/10_000;
 
-    const srcIsEth   = isEthLike(srcLower);
-    const dstIsEth   = isEthLike(dstLower);
-    const srcIsUsdc  = srcLower === TOKENS.USDC_BASE.toLowerCase();
-    const dstIsUsdc  = dstLower === TOKENS.USDC_BASE.toLowerCase();
+      const qs = new URLSearchParams({
+        sellToken: TOKENS.ETH_EEEE,
+        buyToken: TOKENS.USDC_BASE,
+        sellAmount: sellAmount.toString(),
+        takerAddress: addr,
+        slippagePercentage: slippage.toString()
+      });
 
-    // Разрешаем только ETH -> USDC
-    if (!(srcIsEth && dstIsUsdc)) {
-      throw new Error("Live mode: only ETH -> USDC swaps are enabled right now");
-    }
+      const r = await fetch(`${ZEROX_BASE_URL}/swap/v1/quote?${qs}`);
+      if (!r.ok) throw new Error("0x quote failed");
+      const quote = await r.json();
 
-    const sellAmountWei = await getNinetyPercentEth(wallet);
-    const slippageBps = Number(p.slippageBps || 50);
-    const slippagePct = slippageBps / 10_000; // 50 bps = 0.005
+      const router = quote.to.toLowerCase();
+      if (ROUTER_WHITELIST.length>0 &&
+          !ROUTER_WHITELIST.includes(router))
+        throw new Error("Router not whitelisted");
 
-    // Берем котировку 0x
-    const qs = new URLSearchParams({
-      buyToken: TOKENS.USDC_BASE,
-      sellToken: TOKENS.ETH_EEEE,
-      sellAmount: sellAmountWei.toString(),
-      takerAddress: address,
-      slippagePercentage: slippagePct.toString()
-    });
+      const tx = await wallet.sendTransaction({
+        to: quote.to,
+        data: quote.data,
+        value: BigInt(quote.value || "0")
+      });
 
-    const quoteUrl = `${ZEROX_BASE_URL}/swap/v1/quote?${qs.toString()}`;
-    const quoteResp = await fetch(quoteUrl);
-
-    if (!quoteResp.ok) {
-      const txt = await quoteResp.text();
-      console.error("0x quote failed", { status: quoteResp.status, body: txt });
-      return res.status(500).json({
-        ok: false,
-        error: "0x_quote_failed",
-        status: quoteResp.status
+      return res.json({
+        ok:true,
+        mode:"live-sent-eth-usdc",
+        txHash: tx.hash,
+        router,
+        sellAmount: sellAmount.toString(),
+        buyAmount: quote.buyAmount
       });
     }
 
-    const quote = await quoteResp.json();
+    throw new Error("Direction not supported. Allowed: ETH→USDC or USDC→ETH");
 
-    // Адрес роутера из котировки
-    const routerAddress = String(quote.to || "").toLowerCase();
-
-    if (ROUTER_WHITELIST.length > 0 &&
-        !ROUTER_WHITELIST.includes(routerAddress)) {
-      console.error("Router not in whitelist", { routerAddress });
-      throw new Error("Router address not in ROUTER_WHITELIST");
-    }
-
-    console.log("0x quote received", {
-      sellAmount: quote.sellAmount,
-      buyAmount: quote.buyAmount,
-      router: routerAddress,
-      price: quote.price
-    });
-
-    // Готовим транзакцию только на роутер 0x, никаких прямых переводов
-    const txRequest = {
-      to: quote.to,
-      data: quote.data,
-      value: quote.value ? BigInt(quote.value) : 0n
-      // Газ дадим посчитать провайдеру, чтобы не ловить BigInt/JSON ошибки
-    };
-
-    const tx = await wallet.sendTransaction(txRequest);
-
-    console.log("LIVE SWAP SENT", {
-      txHash: tx.hash,
-      from: address,
-      to: routerAddress,
-      sellAmountWei: sellAmountWei.toString()
-    });
-
-    const { secret: _omit2, ...clean } = p;
-
-    return res.json({
-      ok: true,
-      mode: "live-sent",
-      wallet: address,
-      txHash: tx.hash,
-      router: routerAddress,
-      received: clean,
-      plannedSellAmountWei: sellAmountWei.toString(),
-      quote: {
-        sellAmount: quote.sellAmount,
-        buyAmount: quote.buyAmount,
-        price: quote.price
-      }
-    });
-  } catch (err) {
-    console.error("Handler error:", err);
-    return res.status(500).json({ ok: false, error: err.message || "internal_error" });
+  }catch(e){
+    console.error("ERROR:",e);
+    res.status(500).json({ok:false,error:e.message});
   }
 });
 
-// ==== Start ====
-app.listen(PORT, () => {
-  console.log(`tv-webhookl started on port ${PORT}`);
-  console.log("ENV check:", {
-    DRY_RUN,
-    HAS_SHARED_SECRET: !!SHARED_SECRET,
-    HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
-    RPC_ETH:   !!RPCS[1],
-    RPC_BASE:  !!RPCS[8453],
-    RPC_ARB:   !!RPCS[42161],
-    RPC_BASE_URL: RPCS[8453] ? (RPCS[8453].slice(0, 48) + "...") : null,
-    WALLET_WHITELIST_SIZE: WALLET_WHITELIST.length,
-    ROUTER_WHITELIST_SIZE: ROUTER_WHITELIST.length
-  });
+// ===== START =====
+app.listen(PORT, ()=>{
+  console.log("tv-webhookl started on",PORT);
 });
