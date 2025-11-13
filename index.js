@@ -17,6 +17,13 @@ const RPCS = {
   42161:  (process.env.RPC_URL_ARB  || process.env.RPC_ARB  || "").trim(),
 };
 
+// Условные адреса ETH/USDC на Base, чтобы различать направление
+const TOKENS = {
+  ETH_ZERO:  "0x0000000000000000000000000000000000000000",
+  ETH_EEEE:  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  USDC_BASE: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913"
+};
+
 // ---- App ----
 const app = express();
 app.use(bodyParser.json({ limit: "200kb", type: "application/json" }));
@@ -45,6 +52,17 @@ function getWallet(provider) {
   if (!PRIVATE_KEY_RAW) throw new Error("PRIVATE_KEY is not set");
   const pk = PRIVATE_KEY_RAW.startsWith("0x") ? PRIVATE_KEY_RAW : "0x" + PRIVATE_KEY_RAW;
   return new Wallet(pk, provider);
+}
+
+// 90% от баланса ETH (native) в wei
+async function getNinetyPercentEth(wallet) {
+  const addr = await wallet.getAddress();
+  const balance = await wallet.provider.getBalance(addr); // bigint
+  const ninety = balance * 90n / 100n;
+  if (ninety <= 0n) {
+    throw new Error("Not enough ETH balance for 90% calculation");
+  }
+  return ninety;
 }
 
 // ---- Health & Debug ----
@@ -169,19 +187,58 @@ app.post("/", async (req, res) => {
       return res.json({ ok: true, mode: "dry-run", wallet: address, received: clean, signedPreview });
     }
 
-    // LIVE-режим: здесь должен быть реальный свап.
-    // Пока что просто подтверждаем, что live включён.
+    // ---- LIVE-режим: планируем реальный свап (пока без отправки tx) ----
     const { secret: _omit2, ...clean } = p;
-    console.log("Signal accepted (live)", {
-      side: clean.side, chainId: clean.chainId,
-      src: clean.srcToken, dst: clean.dstToken,
-      amountMode: clean.amountMode, amount: clean.amountValue,
-      addr: address, dryRun: false
+
+    if (Number(clean.chainId) !== 8453) {
+      throw new Error(`Unsupported chainId in live mode: ${clean.chainId}`);
+    }
+
+    const srcLower = String(clean.srcToken || "").toLowerCase();
+    const dstLower = String(clean.dstToken || "").toLowerCase();
+
+    const isEth = (addr) => {
+      const a = String(addr || "").toLowerCase();
+      return a === TOKENS.ETH_ZERO.toLowerCase() || a === TOKENS.ETH_EEEE.toLowerCase();
+    };
+
+    const sellIsEth = isEth(srcLower);
+    const buyIsEth  = isEth(dstLower);
+
+    if (!sellIsEth && !buyIsEth) {
+      throw new Error("Live mode: only ETH<->USDC swaps are allowed right now");
+    }
+
+    // Считаем 90% баланса ETH, если он продаётся
+    let plannedSellAmountWei = null;
+    if (sellIsEth) {
+      plannedSellAmountWei = await getNinetyPercentEth(wallet);
+    } else {
+      // В будущем сюда добавим 90% баланса USDC через ERC20, когда это будет безопасно протестировано
+      throw new Error("Live mode from USDC not yet implemented safely");
+    }
+
+    console.log("Signal accepted (live, planning swap)", {
+      side: clean.side,
+      chainId: clean.chainId,
+      src: clean.srcToken,
+      dst: clean.dstToken,
+      amountMode: clean.amountMode,
+      amountFromPayload: clean.amountValue,
+      plannedSellAmountWei,
+      addr: address,
+      dryRun: false
     });
 
-    // TODO: тут подключаем реальный маршрутизатор свапа (Uniswap/0x/Aerodrome) и шлём tx
-    // Для явного признака "live" вернём заглушку (без отправки txHash, пока не подключим роутер):
-    return res.json({ ok: true, mode: "live", wallet: address, received: clean });
+    // TODO: здесь будет реальный вызов 0x / другого роутера и отправка транзакции.
+    // Пока что *только* возвращаем рассчитанный объём, чтобы не стрелять деньгами вслепую.
+    return res.json({
+      ok: true,
+      mode: "live-planning",
+      wallet: address,
+      received: clean,
+      plannedSellAmountWei: plannedSellAmountWei ? plannedSellAmountWei.toString() : null
+    });
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(500).json({ ok: false, error: err.message || "internal_error" });
