@@ -1,7 +1,7 @@
-// index.js — стабильная версия с диагностикой RPC/ENV и Dry-Run/Live
+// index.js — стабильная версия с диагностикой RPC/ENV и Live-свапами через 0x на Base
 import express from "express";
 import bodyParser from "body-parser";
-import { JsonRpcProvider, Wallet } from "ethers";
+import { JsonRpcProvider, Wallet, Contract } from "ethers";
 
 // ---- ENV ----
 const PORT = process.env.PORT || 10000;
@@ -9,20 +9,29 @@ const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY  || "").trim();
 const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-// Нормализованный доступ к RPC по трем сетям.
-// Мы поддерживаем И ЛИБО RPC_URL_BASE, ИЛИ RPC_BASE, ИЛИ RPC — чтобы не промахнуться именем.
+// Нормализованный доступ к RPC по трём сетям
 const RPCS = {
   1:      (process.env.RPC_URL_ETH  || process.env.RPC_ETH  || "").trim(),
   8453:   (process.env.RPC_URL_BASE || process.env.RPC_BASE || process.env.RPC || "").trim(),
   42161:  (process.env.RPC_URL_ARB  || process.env.RPC_ARB  || "").trim(),
 };
 
-// Условные адреса ETH/USDC на Base, чтобы различать направление
+// Адреса для проверки направлений
 const TOKENS = {
   ETH_ZERO:  "0x0000000000000000000000000000000000000000",
   ETH_EEEE:  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-  USDC_BASE: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913"
+  USDC_BASE: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913" // USDC на Base
 };
+
+// 0x Aggregator
+const ZEROX_BASE_URL = "https://base.api.0x.org";
+
+// Минимальный ABI ERC20
+const ERC20_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 value) returns (bool)"
+];
 
 // ---- App ----
 const app = express();
@@ -54,15 +63,52 @@ function getWallet(provider) {
   return new Wallet(pk, provider);
 }
 
-// 90% от баланса ETH (native) в wei
+// ETH-адрес?
+function isEthAddress(addr) {
+  const a = String(addr || "").toLowerCase();
+  return (
+    a === TOKENS.ETH_ZERO.toLowerCase() ||
+    a === TOKENS.ETH_EEEE.toLowerCase()
+  );
+}
+
+// 90% баланса ETH (native) в wei
 async function getNinetyPercentEth(wallet) {
   const addr = await wallet.getAddress();
   const balance = await wallet.provider.getBalance(addr); // bigint
-  const ninety = balance * 90n / 100n;
+  const ninety = (balance * 90n) / 100n;
   if (ninety <= 0n) {
     throw new Error("Not enough ETH balance for 90% calculation");
   }
   return ninety;
+}
+
+// 90% баланса любого токена (ETH или ERC20)
+async function getNinetyPercentOfToken(wallet, tokenAddress) {
+  if (isEthAddress(tokenAddress)) {
+    return getNinetyPercentEth(wallet);
+  }
+  const erc20 = new Contract(tokenAddress, ERC20_ABI, wallet);
+  const addr = await wallet.getAddress();
+  const balance = await erc20.balanceOf(addr); // bigint
+  const ninety = (balance * 90n) / 100n;
+  if (ninety <= 0n) {
+    throw new Error("Not enough token balance for 90% calculation");
+  }
+  return ninety;
+}
+
+// Проверка и выставление allowance для ERC20 под 0x
+async function ensureAllowance(wallet, tokenAddress, spender, amount) {
+  const erc20 = new Contract(tokenAddress, ERC20_ABI, wallet);
+  const owner = await wallet.getAddress();
+  const current = await erc20.allowance(owner, spender);
+  if (current >= amount) {
+    return null;
+  }
+  const tx = await erc20.approve(spender, amount);
+  const receipt = await tx.wait();
+  return receipt.hash;
 }
 
 // ---- Health & Debug ----
@@ -82,15 +128,15 @@ app.get("/env", (_req, res) => {
     RPCS: {
       "1": !!RPCS[1],
       "8453": !!RPCS[8453],
-      "42161": !!RPCS[42161],
+      "42161": !!RPCS[42161]
     },
-    RPC_URL_BASE: RPCS[8453] ? (RPCS[8453].slice(0, 32) + "...") : null,
+    RPC_URL_BASE: RPCS[8453] ? RPCS[8453].slice(0, 32) + "..." : null,
     HAS_SHARED_SECRET: !!SHARED_SECRET,
-    HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
+    HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW
   });
 });
 
-// Диагностика RPC + кошелька (для быстрой проверки)
+// Диагностика RPC + кошелька
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider(8453);
@@ -98,7 +144,7 @@ app.get("/diag", async (_req, res) => {
     const address  = await wallet.getAddress();
     const [blockNumber, balance] = await Promise.all([
       provider.getBlockNumber(),
-      provider.getBalance(address),
+      provider.getBalance(address)
     ]);
 
     res.json({
@@ -110,17 +156,17 @@ app.get("/diag", async (_req, res) => {
       DRY_RUN,
       rpcBaseConfigured: !!RPCS[8453],
       HAS_SHARED_SECRET: !!SHARED_SECRET,
-      HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
+      HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Вернёт адрес кошелька (удобно проверить правильность PRIVATE_KEY)
+// Вернёт адрес кошелька
 app.get("/addr", async (_req, res) => {
   try {
-    const provider = getProvider(8453); // используем Base для деривации
+    const provider = getProvider(8453);
     const wallet = getWallet(provider);
     const address = await wallet.getAddress();
     res.json({ ok: true, address, chainId: 8453 });
@@ -134,7 +180,7 @@ app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
 
-    // Секрет разрешаем из заголовка и из body
+    // Секрет: из заголовка или body
     const hdrSecret = req.get("X-Secret") || req.get("x-secret") || "";
     const bodySecret = typeof body.secret === "string" ? body.secret : "";
     const provided = hdrSecret || bodySecret;
@@ -143,12 +189,12 @@ app.post("/", async (req, res) => {
       return res.status(500).json({ ok: false, error: "server_misconfigured_no_secret" });
     }
     if (provided !== SHARED_SECRET) {
-      const mask = provided ? provided.slice(0,2) + "***" + provided.slice(-2) : "";
+      const mask = provided ? provided.slice(0, 2) + "***" + provided.slice(-2) : "";
       console.warn("Unauthorized payload", { provided: mask });
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    // Валидация полезной нагрузки
+    // Валидация payload’а
     const p = body;
     const required = [
       "action","side","chainId",
@@ -168,7 +214,7 @@ app.post("/", async (req, res) => {
     const wallet = getWallet(provider);
     const address = await wallet.getAddress();
 
-    // DRY-RUN: только подпишем строку, без ончейн
+    // DRY-RUN: без ончейн
     if (DRY_RUN) {
       let signedPreview = null;
       try {
@@ -184,61 +230,108 @@ app.post("/", async (req, res) => {
         amountMode: clean.amountMode, amount: clean.amountValue,
         addr: address, dryRun: true
       });
-      return res.json({ ok: true, mode: "dry-run", wallet: address, received: clean, signedPreview });
+      return res.json({
+        ok: true,
+        mode: "dry-run",
+        wallet: address,
+        received: clean,
+        signedPreview
+      });
     }
 
-    // ---- LIVE-режим: планируем реальный свап (пока без отправки tx) ----
+    // ---------- LIVE-РЕЖИМ: реальный свап через 0x ----------
     const { secret: _omit2, ...clean } = p;
 
     if (Number(clean.chainId) !== 8453) {
       throw new Error(`Unsupported chainId in live mode: ${clean.chainId}`);
     }
 
-    const srcLower = String(clean.srcToken || "").toLowerCase();
-    const dstLower = String(clean.dstToken || "").toLowerCase();
+    const src = String(clean.srcToken || "");
+    const dst = String(clean.dstToken || "");
 
-    const isEth = (addr) => {
-      const a = String(addr || "").toLowerCase();
-      return a === TOKENS.ETH_ZERO.toLowerCase() || a === TOKENS.ETH_EEEE.toLowerCase();
-    };
+    const sellIsEth = isEthAddress(src);
+    const buyIsEth  = isEthAddress(dst);
 
-    const sellIsEth = isEth(srcLower);
-    const buyIsEth  = isEth(dstLower);
+    // Разрешаем только ETH <-> USDC
+    const srcIsUsdc = src.toLowerCase() === TOKENS.USDC_BASE.toLowerCase();
+    const dstIsUsdc = dst.toLowerCase() === TOKENS.USDC_BASE.toLowerCase();
 
-    if (!sellIsEth && !buyIsEth) {
+    if (!(
+      (sellIsEth && dstIsUsdc) ||
+      (srcIsUsdc && buyIsEth)
+    )) {
       throw new Error("Live mode: only ETH<->USDC swaps are allowed right now");
     }
 
-    // Считаем 90% баланса ETH, если он продаётся
-    let plannedSellAmountWei = null;
-    if (sellIsEth) {
-      plannedSellAmountWei = await getNinetyPercentEth(wallet);
-    } else {
-      // В будущем сюда добавим 90% баланса USDC через ERC20, когда это будет безопасно протестировано
-      throw new Error("Live mode from USDC not yet implemented safely");
+    if (clean.amountMode !== "exactIn") {
+      throw new Error("Only exactIn is supported now");
     }
 
-    console.log("Signal accepted (live, planning swap)", {
-      side: clean.side,
-      chainId: clean.chainId,
-      src: clean.srcToken,
-      dst: clean.dstToken,
-      amountMode: clean.amountMode,
-      amountFromPayload: clean.amountValue,
-      plannedSellAmountWei,
-      addr: address,
-      dryRun: false
+    // 90% баланса продаваемого токена
+    const sellAmount = await getNinetyPercentOfToken(wallet, src);
+
+    const slippageBps = Number(clean.slippageBps) || 50;
+    const slippagePercentage = slippageBps / 10000; // 50 bps = 0.005
+
+    // Для 0x ETH всегда как 0xeeee...
+    const zeroXSellToken = sellIsEth ? TOKENS.ETH_EEEE : src;
+    const zeroXBuyToken  = buyIsEth  ? TOKENS.ETH_EEEE : dst;
+
+    const params = new URLSearchParams({
+      sellToken: zeroXSellToken,
+      buyToken: zeroXBuyToken,
+      sellAmount: sellAmount.toString(),
+      takerAddress: address,
+      slippagePercentage: slippagePercentage.toString()
     });
 
-    // TODO: здесь будет реальный вызов 0x / другого роутера и отправка транзакции.
-    // Пока что *только* возвращаем рассчитанный объём, чтобы не стрелять деньгами вслепую.
+    const quoteResp = await fetch(`${ZEROX_BASE_URL}/swap/v1/quote?${params.toString()}`);
+    const quote = await quoteResp.json();
+
+    if (!quoteResp.ok || !quote.to || !quote.data) {
+      console.error("0x quote error:", quote);
+      throw new Error("0x quote failed");
+    }
+
+    // Если продаём USDC — убедиться, что есть allowance
+    let approveTxHash = null;
+    if (!sellIsEth && quote.allowanceTarget) {
+      approveTxHash = await ensureAllowance(wallet, src, quote.allowanceTarget, sellAmount);
+    }
+
+    const txRequest = {
+      to: quote.to,
+      data: quote.data,
+      // ETH прокидываем value, для USDC value = 0
+      value: sellIsEth ? sellAmount : 0n,
+      gasLimit: quote.gas ? BigInt(quote.gas) : undefined
+    };
+
+    const tx = await wallet.sendTransaction(txRequest);
+    const receipt = await tx.wait();
+
+    console.log("LIVE swap executed", {
+      txHash: tx.hash,
+      status: receipt.status,
+      from: address,
+      side: clean.side,
+      sellAmount: sellAmount.toString(),
+      src,
+      dst,
+      approveTxHash
+    });
+
     return res.json({
       ok: true,
-      mode: "live-planning",
+      mode: "live",
       wallet: address,
       received: clean,
-      plannedSellAmountWei: plannedSellAmountWei ? plannedSellAmountWei.toString() : null
+      sellAmountWei: sellAmount.toString(),
+      txHash: tx.hash,
+      approveTxHash,
+      status: receipt.status
     });
+
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(500).json({ ok: false, error: err.message || "internal_error" });
@@ -247,7 +340,6 @@ app.post("/", async (req, res) => {
 
 // ---- Start ----
 app.listen(PORT, () => {
-  // Стартовая диагностика: видно, что видит процесс
   console.log(`Webhook started on port ${PORT}`);
   console.log("ENV check:", {
     DRY_RUN,
@@ -256,6 +348,6 @@ app.listen(PORT, () => {
     RPC_ETH:   !!RPCS[1],
     RPC_BASE:  !!RPCS[8453],
     RPC_ARB:   !!RPCS[42161],
-    RPC_BASE_URL: RPCS[8453] ? (RPCS[8453].slice(0, 48) + "...") : null
+    RPC_BASE_URL: RPCS[8453] ? RPCS[8453].slice(0, 48) + "..." : null
   });
 });
