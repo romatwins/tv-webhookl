@@ -1,5 +1,4 @@
-// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса,
-// multi-Quoter V2 (tuple params), расширенный /diag
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса, multi-Quoter (V1), расширенный /diag
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -19,7 +18,7 @@ const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY   || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90%
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90% баланса
 const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS    || "100", 10));  // 100 = 1%
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
@@ -30,14 +29,14 @@ const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// будем пробовать несколько fee-tier’ов USDC/WETH
+// несколько возможных пулов USDC/WETH
 const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 
 // ========== СЕТЬ / АДРЕСА ==========
 
-const CHAIN_ID_BASE      = 8453;
-const USDC_ADDRESS       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const WETH_ADDRESS       = "0x4200000000000000000000000000000000000006";
+const CHAIN_ID_BASE       = 8453;
+const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
 const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
 // ========== ABI ==========
@@ -50,7 +49,7 @@ const ERC20_ABI = [
 ];
 
 const SWAP_ROUTER_ABI = [
-  "function exactInputSingle((" +
+  "function exactInputSingle(tuple(" +
     "address tokenIn," +
     "address tokenOut," +
     "uint24 fee," +
@@ -67,20 +66,15 @@ const WETH_ABI = [
   "function withdraw(uint256 wad) public"
 ];
 
-// ВАЖНО: QuoterV2 на Base использует tuple params
+// ВАЖНО: Quoter V1 – только один uint256 в ответе
 const QUOTER_ABI = [
-  "function quoteExactInputSingle((" +
+  "function quoteExactInputSingle(" +
     "address tokenIn," +
     "address tokenOut," +
     "uint256 amountIn," +
     "uint24 fee," +
     "uint160 sqrtPriceLimitX96" +
-  ") params) external returns (" +
-    "uint256 amountOut," +
-    "uint160 sqrtPriceX96After," +
-    "uint32 initializedTicksCrossed," +
-    "uint256 gasEstimate" +
-  ")"
+  ") external returns (uint256 amountOut)"
 ];
 
 // ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
@@ -124,7 +118,7 @@ async function getNinetyPercentEth(wallet) {
   return { balance: bal, amount };
 }
 
-// ========== MULTI-QUOTER: выбор лучшего пула ==========
+// ========== MULTI-QUOTER (V1) ==========
 
 async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
   if (!QUOTER_ADDRESS) throw new Error("QUOTER_ADDRESS is not set");
@@ -133,16 +127,14 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
   const quotes = [];
 
   for (const fee of POOL_FEES) {
-    const params = {
-      tokenIn,
-      tokenOut,
-      amountIn,
-      fee,
-      sqrtPriceLimitX96: 0n
-    };
-
     try {
-      const [amountOut] = await quoter.quoteExactInputSingle(params);
+      const amountOut = await quoter.quoteExactInputSingle(
+        tokenIn,
+        tokenOut,
+        amountIn,
+        fee,
+        0n
+      );
       if (amountOut > 0n) {
         quotes.push({ fee, amountOut });
       }
@@ -152,6 +144,16 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
   }
 
   if (!quotes.length) {
+    // В DRY_RUN даём fallback, чтобы можно было тестировать без 500 ошибки
+    if (DRY_RUN) {
+      console.warn("No valid pool quotes (DRY_RUN) – using fallback amountOutMinimum = 0");
+      return {
+        poolFee: POOL_FEES[0],
+        amountOut: 0n,
+        amountOutMinimum: 0n,
+        allQuotes: []
+      };
+    }
     throw new Error("No valid pool quotes");
   }
 
@@ -175,14 +177,14 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
 
 // ========== SWAP-ФУНКЦИИ ==========
 
-// USDC -> ETH (через WETH + unwrap)
+// USDC -> ETH
 async function swapUsdcToEth(wallet) {
   const provider = wallet.provider;
 
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
   const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, wallet); // ВАЖНО: привязан к wallet
 
   const usdcDecimals = await usdc.decimals();
 
@@ -256,12 +258,12 @@ async function swapUsdcToEth(wallet) {
   };
 }
 
-// ETH -> USDC (ETH -> WETH внутри Router)
+// ETH -> USDC
 async function swapEthToUsdc(wallet) {
   const provider = wallet.provider;
 
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, wallet);
 
   const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
 
@@ -327,7 +329,6 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
 });
 
-// Расширенный /diag
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider();
@@ -356,13 +357,13 @@ app.get("/diag", async (_req, res) => {
         usdc.allowance(address, SWAP_ROUTER_ADDRESS)
       ]);
 
-      usdcDecimals      = Number(dec);
-      usdcRaw           = usdcBal.toString();
-      usdcHuman         = formatUnits(usdcBal, usdcDecimals);
-      wethRaw           = wethBal.toString();
-      wethHuman         = formatUnits(wethBal, 18);
-      usdcAllowanceRaw  = allowance.toString();
-      usdcAllowanceOk   = allowance > 0n;
+      usdcDecimals = Number(dec);
+      usdcRaw   = usdcBal.toString();
+      usdcHuman = formatUnits(usdcBal, usdcDecimals);
+      wethRaw   = wethBal.toString();
+      wethHuman = formatUnits(wethBal, 18);
+      usdcAllowanceRaw = allowance.toString();
+      usdcAllowanceOk  = allowance > 0n;
     } catch (e) {
       diagError = e.message;
     }
@@ -413,7 +414,6 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// Основной приёмник сигналов TradingView
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
@@ -468,8 +468,6 @@ app.post("/", async (req, res) => {
     return res.status(500).json({ ok: false, error: err.message || "internal_error" });
   }
 });
-
-// ========== START ==========
 
 app.listen(PORT, () => {
   console.log(`tv-webhookl started on port ${PORT}`);
