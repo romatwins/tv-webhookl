@@ -14,12 +14,12 @@ import {
 
 const PORT = process.env.PORT || 10000;
 
-const RPC_URL_BASE   = (process.env.RPC_URL_BASE || "").trim();
+const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));  // 90% баланса
-const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "100", 10));    // 100 = 1%
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90% баланса
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "100", 10));     // 100 = 1%
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
 const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
@@ -29,7 +29,7 @@ const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// несколько возможных пулов USDC/WETH, будем выбирать лучший
+// несколько возможных пулов USDC/WETH, выбираем лучший
 const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 
 // ========== СЕТЬ / АДРЕСА ==========
@@ -37,8 +37,8 @@ const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 const CHAIN_ID_BASE = 8453;
 
 // официальные адреса на Base
-const USDC_ADDRESS       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const WETH_ADDRESS       = "0x4200000000000000000000000000000000000006";
+const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
 const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
 // ========== ABI ==========
@@ -68,14 +68,15 @@ const WETH_ABI = [
   "function withdraw(uint256 wad) public"
 ];
 
+// ВАЖНО: правильный ABI для QuoterV2 с params-структурой
 const QUOTER_ABI = [
-  "function quoteExactInputSingle(" +
+  "function quoteExactInputSingle((" +
     "address tokenIn," +
     "address tokenOut," +
-    "uint256 amountIn," +
     "uint24 fee," +
+    "uint256 amountIn," +
     "uint160 sqrtPriceLimitX96" +
-  ") external returns (" +
+  ") params) external returns (" +
     "uint256 amountOut," +
     "uint160 sqrtPriceX96After," +
     "uint32 initializedTicksCrossed," +
@@ -136,13 +137,17 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
 
   for (const fee of POOL_FEES) {
     try {
-      const [amountOut] = await quoter.quoteExactInputSingle(
+      // правильный struct params + staticCall, чтобы не слать транзакцию
+      const params = {
         tokenIn,
         tokenOut,
-        amountIn,
         fee,
-        0n
-      );
+        amountIn,
+        sqrtPriceLimitX96: 0n
+      };
+
+      const [amountOut] = await quoter.quoteExactInputSingle.staticCall(params);
+
       if (amountOut > 0n) {
         quotes.push({ fee, amountOut });
       }
@@ -385,7 +390,6 @@ app.get("/diag", async (_req, res) => {
       whitelisted,
       rpcBaseConfigured: !!RPC_URL_BASE,
 
-      // Балансы
       balances: {
         ethWei: baseBalance.toString(),
         eth: ethHuman,
@@ -395,23 +399,18 @@ app.get("/diag", async (_req, res) => {
         weth: wethHuman
       },
 
-      // Allowance
       allowance: {
         router: SWAP_ROUTER_ADDRESS,
         usdcAllowanceWei: usdcAllowanceRaw,
         usdcAllowanceOk
       },
 
-      // Подсказки по направлениям
       directions: {
         canBuy_USDC_to_ETH: canBuy,
         canSell_ETH_to_USDC: canSell
       },
 
-      // Пулы, которые будем использовать
       poolFees: POOL_FEES,
-
-      // возможная ошибка при чтении токенов
       tokenDiagError: diagError
     });
   } catch (e) {
