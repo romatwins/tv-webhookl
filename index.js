@@ -1,5 +1,5 @@
-// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH,
-// 90% баланса, multi-QuoterV2, DRY_RUN, расширенный /diag
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса,
+// multi-Quoter V2 (tuple params), расширенный /diag
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -19,28 +19,26 @@ const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY   || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90% баланса
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90%
 const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS    || "100", 10));  // 100 = 1%
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-const RAW_QUOTER_ADDRESS = (process.env.QUOTER_ADDRESS || "").trim();
-const QUOTER_ADDRESS     = RAW_QUOTER_ADDRESS ? RAW_QUOTER_ADDRESS.toLowerCase() : "";
+const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
 
-// whitelist
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// несколько возможных пулов USDC/WETH, будем выбирать лучший
+// будем пробовать несколько fee-tier’ов USDC/WETH
 const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 
 // ========== СЕТЬ / АДРЕСА ==========
 
-const CHAIN_ID_BASE       = 8453;
-const USDC_ADDRESS        = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".toLowerCase();
-const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006".toLowerCase();
-const SWAP_ROUTER_ADDRESS = "0x2626664c2603336e57b271c5c0b26f421741e481".toLowerCase();
+const CHAIN_ID_BASE      = 8453;
+const USDC_ADDRESS       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS       = "0x4200000000000000000000000000000000000006";
+const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
 // ========== ABI ==========
 
@@ -52,7 +50,7 @@ const ERC20_ABI = [
 ];
 
 const SWAP_ROUTER_ABI = [
-  "function exactInputSingle(tuple(" +
+  "function exactInputSingle((" +
     "address tokenIn," +
     "address tokenOut," +
     "uint24 fee," +
@@ -69,15 +67,15 @@ const WETH_ABI = [
   "function withdraw(uint256 wad) public"
 ];
 
-// Quoter V2
+// ВАЖНО: QuoterV2 на Base использует tuple params
 const QUOTER_ABI = [
-  "function quoteExactInputSingle(" +
+  "function quoteExactInputSingle((" +
     "address tokenIn," +
     "address tokenOut," +
     "uint256 amountIn," +
     "uint24 fee," +
     "uint160 sqrtPriceLimitX96" +
-  ") external returns (" +
+  ") params) external returns (" +
     "uint256 amountOut," +
     "uint160 sqrtPriceX96After," +
     "uint32 initializedTicksCrossed," +
@@ -88,9 +86,7 @@ const QUOTER_ABI = [
 // ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
 
 function getProvider() {
-  if (!RPC_URL_BASE) {
-    throw new Error("RPC_URL_BASE is not set");
-  }
+  if (!RPC_URL_BASE) throw new Error("RPC_URL_BASE is not set");
   return new JsonRpcProvider(RPC_URL_BASE, CHAIN_ID_BASE);
 }
 
@@ -110,7 +106,7 @@ function normalizeBody(raw) {
   return { _raw: raw };
 }
 
-// 90% баланса USDC
+// 90% USDC
 async function getNinetyPercentUsdc(wallet, usdc) {
   const bal = await usdc.balanceOf(wallet.address);
   if (bal === 0n) throw new Error("USDC balance is zero");
@@ -119,7 +115,7 @@ async function getNinetyPercentUsdc(wallet, usdc) {
   return { balance: bal, amount };
 }
 
-// 90% баланса native ETH
+// 90% native ETH
 async function getNinetyPercentEth(wallet) {
   const bal = await wallet.provider.getBalance(wallet.address);
   if (bal === 0n) throw new Error("ETH balance is zero");
@@ -137,20 +133,21 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
   const quotes = [];
 
   for (const fee of POOL_FEES) {
+    const params = {
+      tokenIn,
+      tokenOut,
+      amountIn,
+      fee,
+      sqrtPriceLimitX96: 0n
+    };
+
     try {
-      // ВАЖНО: в ethers v6 Quoter вызывается через .staticCall, иначе он пытается sendTransaction
-      const [amountOut] = await quoter.quoteExactInputSingle.staticCall(
-        tokenIn,
-        tokenOut,
-        amountIn,
-        fee,
-        0n
-      );
+      const [amountOut] = await quoter.quoteExactInputSingle(params);
       if (amountOut > 0n) {
         quotes.push({ fee, amountOut });
       }
     } catch (e) {
-      console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
+      console.warn("Quoter fee failed", fee, e.message);
     }
   }
 
@@ -161,7 +158,7 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
   quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1));
   const best = quotes[0];
 
-  const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 100 = 9900 (1% slippage)
+  const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 100 = 9900 (1%)
   const minOut = (best.amountOut * slippageFactor) / 10000n;
   if (minOut <= 0n) throw new Error("Computed amountOutMinimum is zero");
 
@@ -189,8 +186,7 @@ async function swapUsdcToEth(wallet) {
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: usdcBalance, amount: amountIn } =
-    await getNinetyPercentUsdc(wallet, usdc);
+  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentUsdc(wallet, usdc);
 
   const allowance = await usdc.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
@@ -267,8 +263,7 @@ async function swapEthToUsdc(wallet) {
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
   const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
-  const { balance: ethBalance, amount: amountIn } =
-    await getNinetyPercentEth(wallet);
+  const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
 
   const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
     quoter,
@@ -332,7 +327,7 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
 });
 
-// расширенный /diag
+// Расширенный /diag
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider();
@@ -361,13 +356,13 @@ app.get("/diag", async (_req, res) => {
         usdc.allowance(address, SWAP_ROUTER_ADDRESS)
       ]);
 
-      usdcDecimals = Number(dec);
-      usdcRaw   = usdcBal.toString();
-      usdcHuman = formatUnits(usdcBal, usdcDecimals);
-      wethRaw   = wethBal.toString();
-      wethHuman = formatUnits(wethBal, 18);
-      usdcAllowanceRaw = allowance.toString();
-      usdcAllowanceOk  = allowance > 0n;
+      usdcDecimals      = Number(dec);
+      usdcRaw           = usdcBal.toString();
+      usdcHuman         = formatUnits(usdcBal, usdcDecimals);
+      wethRaw           = wethBal.toString();
+      wethHuman         = formatUnits(wethBal, 18);
+      usdcAllowanceRaw  = allowance.toString();
+      usdcAllowanceOk   = allowance > 0n;
     } catch (e) {
       diagError = e.message;
     }
@@ -418,7 +413,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// основной приёмник TradingView
+// Основной приёмник сигналов TradingView
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
