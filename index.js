@@ -1,4 +1,5 @@
-// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса, multi-Quoter, расширенный /diag
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH,
+// 90% баланса, multi-QuoterV2, DRY_RUN, расширенный /diag
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -15,31 +16,31 @@ import {
 const PORT = process.env.PORT || 10000;
 
 const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
-const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY || "").trim();
+const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY   || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
 const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));   // 90% баланса
-const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "100", 10));     // 100 = 1%
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS    || "100", 10));  // 100 = 1%
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
+const RAW_QUOTER_ADDRESS = (process.env.QUOTER_ADDRESS || "").trim();
+const QUOTER_ADDRESS     = RAW_QUOTER_ADDRESS ? RAW_QUOTER_ADDRESS.toLowerCase() : "";
 
+// whitelist
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// несколько возможных пулов USDC/WETH, выбираем лучший
+// несколько возможных пулов USDC/WETH, будем выбирать лучший
 const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 
 // ========== СЕТЬ / АДРЕСА ==========
 
-const CHAIN_ID_BASE = 8453;
-
-// официальные адреса на Base
-const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
-const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
+const CHAIN_ID_BASE       = 8453;
+const USDC_ADDRESS        = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".toLowerCase();
+const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006".toLowerCase();
+const SWAP_ROUTER_ADDRESS = "0x2626664c2603336e57b271c5c0b26f421741e481".toLowerCase();
 
 // ========== ABI ==========
 
@@ -68,15 +69,15 @@ const WETH_ABI = [
   "function withdraw(uint256 wad) public"
 ];
 
-// ВАЖНО: правильный ABI для QuoterV2 с params-структурой
+// Quoter V2
 const QUOTER_ABI = [
-  "function quoteExactInputSingle((" +
+  "function quoteExactInputSingle(" +
     "address tokenIn," +
     "address tokenOut," +
-    "uint24 fee," +
     "uint256 amountIn," +
+    "uint24 fee," +
     "uint160 sqrtPriceLimitX96" +
-  ") params) external returns (" +
+  ") external returns (" +
     "uint256 amountOut," +
     "uint160 sqrtPriceX96After," +
     "uint32 initializedTicksCrossed," +
@@ -137,22 +138,19 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
 
   for (const fee of POOL_FEES) {
     try {
-      // правильный struct params + staticCall, чтобы не слать транзакцию
-      const params = {
+      // ВАЖНО: в ethers v6 Quoter вызывается через .staticCall, иначе он пытается sendTransaction
+      const [amountOut] = await quoter.quoteExactInputSingle.staticCall(
         tokenIn,
         tokenOut,
-        fee,
         amountIn,
-        sqrtPriceLimitX96: 0n
-      };
-
-      const [amountOut] = await quoter.quoteExactInputSingle.staticCall(params);
-
+        fee,
+        0n
+      );
       if (amountOut > 0n) {
         quotes.push({ fee, amountOut });
       }
     } catch (e) {
-      console.warn("Quoter fee failed", fee, e.message);
+      console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
     }
   }
 
@@ -160,7 +158,7 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
     throw new Error("No valid pool quotes");
   }
 
-  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1)); // лучший = max amountOut
+  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1));
   const best = quotes[0];
 
   const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 100 = 9900 (1% slippage)
@@ -191,7 +189,8 @@ async function swapUsdcToEth(wallet) {
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentUsdc(wallet, usdc);
+  const { balance: usdcBalance, amount: amountIn } =
+    await getNinetyPercentUsdc(wallet, usdc);
 
   const allowance = await usdc.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
@@ -206,7 +205,7 @@ async function swapUsdcToEth(wallet) {
     amountIn
   );
 
-  const deadline = Math.floor(Date.now() / 1000) + 600; // 10 минут
+  const deadline = Math.floor(Date.now() / 1000) + 600;
 
   const params = {
     tokenIn: USDC_ADDRESS,
@@ -268,7 +267,8 @@ async function swapEthToUsdc(wallet) {
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
   const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
-  const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
+  const { balance: ethBalance, amount: amountIn } =
+    await getNinetyPercentEth(wallet);
 
   const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
     quoter,
@@ -332,7 +332,7 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
 });
 
-// Расширенный /diag
+// расширенный /diag
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider();
@@ -379,7 +379,7 @@ app.get("/diag", async (_req, res) => {
     const ethHuman = formatUnits(baseBalance, 18);
 
     const canBuy  = usdcRaw !== null && BigInt(usdcRaw) > 0n;
-    const canSell = baseBalance > 0n; // SELL использует native ETH
+    const canSell = baseBalance > 0n;
 
     res.json({
       ok: true,
@@ -418,7 +418,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// Основной приёмник сигналов TradingView
+// основной приёмник TradingView
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
