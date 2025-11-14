@@ -1,4 +1,4 @@
-// index.js – Uniswap v3 SwapRouter02 + QuoterV2 + Multi-Fee Selection + ETH<->USDC
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса, multi-Quoter, расширенный /diag
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -6,304 +6,488 @@ import {
   JsonRpcProvider,
   Wallet,
   Contract,
-  MaxUint256
+  MaxUint256,
+  formatUnits
 } from "ethers";
 
-// ---------- ENV ----------
+// ========== ENV ==========
 
 const PORT = process.env.PORT || 10000;
 
-const RPC_URL_BASE = (process.env.RPC_URL_BASE || "").trim();
+const RPC_URL_BASE   = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY || "").trim();
-const SHARED_SECRET = (process.env.SHARED_SECRET || "").trim();
+const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));
-const SLIPPAGE_BPS = BigInt(parseInt(process.env.SLIPPAGE_BPS || "100", 10)); // 1%
-const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));  // 90% баланса
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "100", 10));    // 100 = 1%
+const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-const QUOTER_ADDRESS = (process.env.QUOTER_ADDRESS || "").trim();
+const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
 
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
-  .split(",").map(a => a.trim().toLowerCase()).filter(Boolean);
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
-// ---------- CONST ----------
+// несколько возможных пулов USDC/WETH, будем выбирать лучший
+const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
 
-// Base
+// ========== СЕТЬ / АДРЕСА ==========
+
 const CHAIN_ID_BASE = 8453;
-const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const WETH = "0x4200000000000000000000000000000000000006";
-const SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
-// fee tiers, Uniswap v3
-const FEE_TIERS = [100, 500, 3000, 10000];
+// официальные адреса на Base
+const USDC_ADDRESS       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS       = "0x4200000000000000000000000000000000000006";
+const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
-// ---------- ABI ----------
+// ========== ABI ==========
 
 const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function allowance(address owner, address spender) view returns (uint256)",
-  "function approve(address spender, uint256 amount) returns (bool)",
+  "function approve(address spender, uint256 value) returns (bool)",
   "function decimals() view returns (uint8)"
+];
+
+const SWAP_ROUTER_ABI = [
+  "function exactInputSingle(tuple(" +
+    "address tokenIn," +
+    "address tokenOut," +
+    "uint24 fee," +
+    "address recipient," +
+    "uint256 deadline," +
+    "uint256 amountIn," +
+    "uint256 amountOutMinimum," +
+    "uint160 sqrtPriceLimitX96" +
+  ") params) external payable returns (uint256 amountOut)"
 ];
 
 const WETH_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
-  "function withdraw(uint256 wad)"
-];
-
-const ROUTER_ABI = [
-  "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) external payable returns (uint256)"
+  "function withdraw(uint256 wad) public"
 ];
 
 const QUOTER_ABI = [
-  "function quoteExactInputSingle(address,address,uint256,uint24,uint160) external returns (uint256,uint160,uint32,uint256)"
+  "function quoteExactInputSingle(" +
+    "address tokenIn," +
+    "address tokenOut," +
+    "uint256 amountIn," +
+    "uint24 fee," +
+    "uint160 sqrtPriceLimitX96" +
+  ") external returns (" +
+    "uint256 amountOut," +
+    "uint160 sqrtPriceX96After," +
+    "uint32 initializedTicksCrossed," +
+    "uint256 gasEstimate" +
+  ")"
 ];
 
-// ---------- HELPERS ----------
+// ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
 
-function provider() {
-  if (!RPC_URL_BASE) throw new Error("RPC_URL_BASE missing");
+function getProvider() {
+  if (!RPC_URL_BASE) {
+    throw new Error("RPC_URL_BASE is not set");
+  }
   return new JsonRpcProvider(RPC_URL_BASE, CHAIN_ID_BASE);
 }
 
-function wallet(p) {
-  if (!PRIVATE_KEY_RAW) throw new Error("PRIVATE_KEY missing");
+function getWallet(provider) {
+  if (!PRIVATE_KEY_RAW) throw new Error("PRIVATE_KEY is not set");
   const pk = PRIVATE_KEY_RAW.startsWith("0x") ? PRIVATE_KEY_RAW : "0x" + PRIVATE_KEY_RAW;
-  return new Wallet(pk, p);
+  return new Wallet(pk, provider);
 }
 
 function normalizeBody(raw) {
+  if (raw == null) return null;
   if (typeof raw === "object") return raw;
   if (typeof raw === "string") {
-    try { return JSON.parse(raw); } catch { return { _raw: raw }; }
+    const t = raw.trim();
+    try { return JSON.parse(t); } catch { return { _raw: t }; }
   }
-  return {};
+  return { _raw: raw };
 }
 
-// ---------- BALANCE 90% ----------
-
-async function ninetyPctEth(w) {
-  const bal = await w.provider.getBalance(w.address);
-  if (bal === 0n) throw new Error("ETH balance zero");
-  return { balance: bal, amount: (bal * PERCENT_TO_SWAP) / 100n };
+// 90% баланса USDC
+async function getNinetyPercentUsdc(wallet, usdc) {
+  const bal = await usdc.balanceOf(wallet.address);
+  if (bal === 0n) throw new Error("USDC balance is zero");
+  const amount = (bal * PERCENT_TO_SWAP) / 100n;
+  if (amount <= 0n) throw new Error("USDC amount to swap is zero");
+  return { balance: bal, amount };
 }
 
-async function ninetyPctUsdc(w, usdc) {
-  const bal = await usdc.balanceOf(w.address);
-  if (bal === 0n) throw new Error("USDC balance zero");
-  return { balance: bal, amount: (bal * PERCENT_TO_SWAP) / 100n };
+// 90% баланса native ETH
+async function getNinetyPercentEth(wallet) {
+  const bal = await wallet.provider.getBalance(wallet.address);
+  if (bal === 0n) throw new Error("ETH balance is zero");
+  const amount = (bal * PERCENT_TO_SWAP) / 100n;
+  if (amount <= 0n) throw new Error("ETH amount to swap is zero");
+  return { balance: bal, amount };
 }
 
-// ---------- MULTI-QUOTER (выбор лучшего fee-tier) ----------
+// ========== MULTI-QUOTER: выбор лучшего пула ==========
 
-async function getBestRoute(quoter, tokenIn, tokenOut, amountIn) {
-  let best = null;
+async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
+  if (!QUOTER_ADDRESS) throw new Error("QUOTER_ADDRESS is not set");
+  if (amountIn <= 0n) throw new Error("AmountIn must be > 0");
 
-  for (const fee of FEE_TIERS) {
+  const quotes = [];
+
+  for (const fee of POOL_FEES) {
     try {
       const [amountOut] = await quoter.quoteExactInputSingle(
-        tokenIn, tokenOut, amountIn, fee, 0n
+        tokenIn,
+        tokenOut,
+        amountIn,
+        fee,
+        0n
       );
-
       if (amountOut > 0n) {
-        if (!best || amountOut > best.amountOut) {
-          best = { fee, amountOut };
-        }
+        quotes.push({ fee, amountOut });
       }
-    } catch (_) {}
+    } catch (e) {
+      console.warn("Quoter fee failed", fee, e.message);
+    }
   }
 
-  if (!best) throw new Error("No valid pool quotes");
+  if (!quotes.length) {
+    throw new Error("No valid pool quotes");
+  }
 
-  const sl = (10000n - SLIPPAGE_BPS);
-  const minOut = (best.amountOut * sl) / 10000n;
+  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1)); // лучший = max amountOut
+  const best = quotes[0];
 
-  if (minOut <= 0n) throw new Error("Slippage minOut zero");
+  const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 100 = 9900 (1% slippage)
+  const minOut = (best.amountOut * slippageFactor) / 10000n;
+  if (minOut <= 0n) throw new Error("Computed amountOutMinimum is zero");
 
   return {
-    bestFee: best.fee,
+    poolFee: best.fee,
     amountOut: best.amountOut,
-    amountOutMinimum: minOut
+    amountOutMinimum: minOut,
+    allQuotes: quotes.map(q => ({
+      fee: q.fee,
+      amountOut: q.amountOut.toString()
+    }))
   };
 }
 
-// ---------- SWAPs ----------
+// ========== SWAP-ФУНКЦИИ ==========
 
-async function swap_USDC_to_ETH(w) {
-  const p = w.provider;
+// USDC -> ETH (через WETH + unwrap)
+async function swapUsdcToEth(wallet) {
+  const provider = wallet.provider;
 
-  const usdc = new Contract(USDC, ERC20_ABI, w);
-  const weth = new Contract(WETH, WETH_ABI, w);
-  const router = new Contract(SWAP_ROUTER, ROUTER_ABI, w);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, p);
+  const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
+  const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
+  const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
+  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
-  const { amount: amountIn, balance: usdcBal } = await ninetyPctUsdc(w, usdc);
+  const usdcDecimals = await usdc.decimals();
 
-  // allowance
-  const allow = await usdc.allowance(w.address, SWAP_ROUTER);
-  if (allow < amountIn) {
-    const aTx = await usdc.approve(SWAP_ROUTER, MaxUint256);
-    await aTx.wait();
+  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentUsdc(wallet, usdc);
+
+  const allowance = await usdc.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
+  if (!DRY_RUN && allowance < amountIn) {
+    const approveTx = await usdc.approve(SWAP_ROUTER_ADDRESS, MaxUint256);
+    await approveTx.wait();
   }
 
-  // choose best pool
-  const route = await getBestRoute(quoter, USDC, WETH, amountIn);
+  const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
+    quoter,
+    USDC_ADDRESS,
+    WETH_ADDRESS,
+    amountIn
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + 600; // 10 минут
 
   const params = {
-    tokenIn: USDC,
-    tokenOut: WETH,
-    fee: route.bestFee,
-    recipient: w.address,
-    deadline: Math.floor(Date.now() / 1000) + 600,
+    tokenIn: USDC_ADDRESS,
+    tokenOut: WETH_ADDRESS,
+    fee: poolFee,
+    recipient: wallet.address,
+    deadline,
     amountIn,
-    amountOutMinimum: route.amountOutMinimum,
+    amountOutMinimum,
     sqrtPriceLimitX96: 0n
   };
 
   if (DRY_RUN) {
     return {
       mode: "dry-run",
-      direction: "USDC→ETH",
+      direction: "USDC_TO_ETH",
       amountIn: amountIn.toString(),
-      bestFee: route.bestFee,
-      quotedOut: route.amountOut.toString(),
-      minOut: route.amountOutMinimum.toString(),
-      usdcBalance: usdcBal.toString()
+      amountOut: amountOut.toString(),
+      amountOutMinimum: amountOutMinimum.toString(),
+      usdcBalance: usdcBalance.toString(),
+      usdcBalanceHuman: formatUnits(usdcBalance, usdcDecimals),
+      chosenPoolFee: poolFee,
+      poolQuotes: allQuotes
     };
   }
 
   const tx = await router.exactInputSingle(params, { value: 0n });
-  const rc = await tx.wait();
+  const receipt = await tx.wait();
 
-  // unwrap WETH
-  const wethBal = await weth.balanceOf(w.address);
-  if (wethBal > 0n) {
-    const uw = await weth.withdraw(wethBal);
-    await uw.wait();
+  const wethBalance = await weth.balanceOf(wallet.address);
+  let unwrapHash = null;
+  if (wethBalance > 0n) {
+    const unwrapTx = await weth.withdraw(wethBalance);
+    await unwrapTx.wait();
+    unwrapHash = unwrapTx.hash;
   }
 
   return {
     mode: "live",
-    direction: "USDC→ETH",
+    direction: "USDC_TO_ETH",
     txHash: tx.hash,
-    block: rc.blockNumber,
+    blockNumber: receipt.blockNumber,
     amountIn: amountIn.toString(),
-    minOut: route.amountOutMinimum.toString(),
-    bestFee: route.bestFee
+    amountOutMinimum: amountOutMinimum.toString(),
+    quotedAmountOut: amountOut.toString(),
+    chosenPoolFee: poolFee,
+    poolQuotes: allQuotes,
+    usdcBalanceBefore: usdcBalance.toString(),
+    usdcBalanceBeforeHuman: formatUnits(usdcBalance, usdcDecimals),
+    wethUnwrapped: wethBalance.toString(),
+    unwrapTxHash: unwrapHash
   };
 }
 
-async function swap_ETH_to_USDC(w) {
-  const p = w.provider;
+// ETH -> USDC (ETH -> WETH внутри Router)
+async function swapEthToUsdc(wallet) {
+  const provider = wallet.provider;
 
-  const router = new Contract(SWAP_ROUTER, ROUTER_ABI, w);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, p);
+  const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
+  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
-  const { amount: amountIn, balance: ethBal } = await ninetyPctEth(w);
+  const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
 
-  const route = await getBestRoute(quoter, WETH, USDC, amountIn);
+  const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
+    quoter,
+    WETH_ADDRESS,
+    USDC_ADDRESS,
+    amountIn
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + 600;
 
   const params = {
-    tokenIn: WETH,
-    tokenOut: USDC,
-    fee: route.bestFee,
-    recipient: w.address,
-    deadline: Math.floor(Date.now() / 1000) + 600,
+    tokenIn: WETH_ADDRESS,
+    tokenOut: USDC_ADDRESS,
+    fee: poolFee,
+    recipient: wallet.address,
+    deadline,
     amountIn,
-    amountOutMinimum: route.amountOutMinimum,
+    amountOutMinimum,
     sqrtPriceLimitX96: 0n
   };
 
   if (DRY_RUN) {
     return {
       mode: "dry-run",
-      direction: "ETH→USDC",
+      direction: "ETH_TO_USDC",
       amountIn: amountIn.toString(),
-      bestFee: route.bestFee,
-      quotedOut: route.amountOut.toString(),
-      minOut: route.amountOutMinimum.toString(),
-      ethBalance: ethBal.toString()
+      amountOut: amountOut.toString(),
+      amountOutMinimum: amountOutMinimum.toString(),
+      ethBalance: ethBalance.toString(),
+      ethBalanceHuman: formatUnits(ethBalance, 18),
+      chosenPoolFee: poolFee,
+      poolQuotes: allQuotes
     };
   }
 
   const tx = await router.exactInputSingle(params, { value: amountIn });
-  const rc = await tx.wait();
+  const receipt = await tx.wait();
 
   return {
     mode: "live",
-    direction: "ETH→USDC",
+    direction: "ETH_TO_USDC",
     txHash: tx.hash,
-    block: rc.blockNumber,
+    blockNumber: receipt.blockNumber,
     amountIn: amountIn.toString(),
-    minOut: route.amountOutMinimum.toString(),
-    bestFee: route.bestFee
+    amountOutMinimum: amountOutMinimum.toString(),
+    quotedAmountOut: amountOut.toString(),
+    chosenPoolFee: poolFee,
+    poolQuotes: allQuotes,
+    ethBalanceBefore: ethBalance.toString(),
+    ethBalanceBeforeHuman: formatUnits(ethBalance, 18)
   };
 }
 
-// ---------- APP ----------
+// ========== EXPRESS APP ==========
 
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.text());
+app.use(bodyParser.json({ limit: "200kb", type: "application/json" }));
+app.use(bodyParser.text({ limit: "200kb", type: "*/*" }));
 
-app.get("/", (_r, res) => res.json({ ok: true, service: "tv-webhookl" }));
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
+});
 
+// Расширенный /diag
 app.get("/diag", async (_req, res) => {
   try {
-    const p = provider();
-    const w = wallet(p);
-    const bal = await p.getBalance(w.address);
+    const provider = getProvider();
+    const wallet   = getWallet(provider);
+    const address  = await wallet.getAddress();
+
+    const baseBalance = await provider.getBalance(address);
+
+    let usdcRaw = null;
+    let usdcHuman = null;
+    let wethRaw = null;
+    let wethHuman = null;
+    let usdcAllowanceRaw = null;
+    let usdcAllowanceOk = null;
+    let usdcDecimals = 6;
+    let diagError = null;
+
+    try {
+      const usdc = new Contract(USDC_ADDRESS, ERC20_ABI, provider);
+      const weth = new Contract(WETH_ADDRESS, WETH_ABI, provider);
+
+      const [usdcBal, dec, wethBal, allowance] = await Promise.all([
+        usdc.balanceOf(address),
+        usdc.decimals(),
+        weth.balanceOf(address),
+        usdc.allowance(address, SWAP_ROUTER_ADDRESS)
+      ]);
+
+      usdcDecimals = Number(dec);
+      usdcRaw   = usdcBal.toString();
+      usdcHuman = formatUnits(usdcBal, usdcDecimals);
+      wethRaw   = wethBal.toString();
+      wethHuman = formatUnits(wethBal, 18);
+      usdcAllowanceRaw = allowance.toString();
+      usdcAllowanceOk  = allowance > 0n;
+    } catch (e) {
+      diagError = e.message;
+    }
+
+    const whitelisted =
+      WALLET_WHITELIST.length === 0 ||
+      WALLET_WHITELIST.includes(address.toLowerCase());
+
+    const ethHuman = formatUnits(baseBalance, 18);
+
+    const canBuy  = usdcRaw !== null && BigInt(usdcRaw) > 0n;
+    const canSell = baseBalance > 0n; // SELL использует native ETH
 
     res.json({
       ok: true,
-      address: w.address,
-      balanceWei: bal.toString(),
+      address,
+      chainId: CHAIN_ID_BASE,
       DRY_RUN,
-      whitelisted: WALLET_WHITELIST.length === 0 ||
-                   WALLET_WHITELIST.includes(w.address.toLowerCase()),
-      hasQuoter: !!QUOTER_ADDRESS
+      hasQuoter: !!QUOTER_ADDRESS,
+      whitelisted,
+      rpcBaseConfigured: !!RPC_URL_BASE,
+
+      // Балансы
+      balances: {
+        ethWei: baseBalance.toString(),
+        eth: ethHuman,
+        usdcWei: usdcRaw,
+        usdc: usdcHuman,
+        wethWei: wethRaw,
+        weth: wethHuman
+      },
+
+      // Allowance
+      allowance: {
+        router: SWAP_ROUTER_ADDRESS,
+        usdcAllowanceWei: usdcAllowanceRaw,
+        usdcAllowanceOk
+      },
+
+      // Подсказки по направлениям
+      directions: {
+        canBuy_USDC_to_ETH: canBuy,
+        canSell_ETH_to_USDC: canSell
+      },
+
+      // Пулы, которые будем использовать
+      poolFees: POOL_FEES,
+
+      // возможная ошибка при чтении токенов
+      tokenDiagError: diagError
     });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-// RECEIVE TRADINGVIEW
-app.post("/", async (req, res) => {
-  try {
-    const body = normalizeBody(req.body);
-    const sec = req.get("X-Secret") || body.secret;
-
-    if (sec !== SHARED_SECRET) return res.status(401).json({ ok: false, error: "unauthorized" });
-
-    const p = provider();
-    const w = wallet(p);
-
-    if (WALLET_WHITELIST.length > 0 &&
-        !WALLET_WHITELIST.includes(w.address.toLowerCase())) {
-      throw new Error("Wallet not whitelisted");
-    }
-
-    const side = String(body.side).toUpperCase();
-
-    let result;
-    if (side === "BUY") {
-      result = await swap_USDC_to_ETH(w);
-    } else if (side === "SELL") {
-      result = await swap_ETH_to_USDC(w);
-    } else {
-      throw new Error(`Unknown side: ${side}`);
-    }
-
-    res.json({ ok: true, ...result });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------- START ----------
+// Основной приёмник сигналов TradingView
+app.post("/", async (req, res) => {
+  try {
+    const body = normalizeBody(req.body) || {};
+
+    const hdrSecret  = req.get("X-Secret") || req.get("x-secret") || "";
+    const bodySecret = typeof body.secret === "string" ? body.secret : "";
+    const provided   = hdrSecret || bodySecret;
+
+    if (!SHARED_SECRET) {
+      return res.status(500).json({ ok: false, error: "server_misconfigured_no_secret" });
+    }
+    if (provided !== SHARED_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const p = body;
+
+    if (Number(p.chainId || CHAIN_ID_BASE) !== CHAIN_ID_BASE) {
+      throw new Error(`Unsupported chainId: ${p.chainId}, only 8453 is allowed`);
+    }
+
+    const provider = getProvider();
+    const wallet   = getWallet(provider);
+    const address  = await wallet.getAddress();
+
+    if (
+      WALLET_WHITELIST.length > 0 &&
+      !WALLET_WHITELIST.includes(address.toLowerCase())
+    ) {
+      throw new Error("Wallet address is not in WALLET_WHITELIST");
+    }
+
+    const side = String(p.side || "").toUpperCase();
+
+    let result;
+    if (side === "BUY") {
+      result = await swapUsdcToEth(wallet);
+    } else if (side === "SELL") {
+      result = await swapEthToUsdc(wallet);
+    } else {
+      throw new Error(`Unknown side: ${p.side}`);
+    }
+
+    return res.json({
+      ok: true,
+      receivedSide: side,
+      wallet: address,
+      ...result
+    });
+  } catch (err) {
+    console.error("Handler error:", err);
+    return res.status(500).json({ ok: false, error: err.message || "internal_error" });
+  }
+});
+
+// ========== START ==========
 
 app.listen(PORT, () => {
-  console.log("tv-webhookl started on port", PORT);
+  console.log(`tv-webhookl started on port ${PORT}`);
+  console.log("ENV check:", {
+    DRY_RUN,
+    RPC_URL_BASE: RPC_URL_BASE ? RPC_URL_BASE.slice(0, 48) + "..." : null,
+    HAS_SHARED_SECRET: !!SHARED_SECRET,
+    HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
+    HAS_QUOTER: !!QUOTER_ADDRESS,
+    PERCENT_TO_SWAP: PERCENT_TO_SWAP.toString(),
+    SLIPPAGE_BPS: SLIPPAGE_BPS.toString(),
+    POOL_FEES,
+    WALLET_WHITELIST_SIZE: WALLET_WHITELIST.length
+  });
 });
