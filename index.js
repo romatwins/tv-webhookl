@@ -1,4 +1,8 @@
-// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса, multi-Quoter, /diag
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH
+//  • Поддержка 90% баланса ИЛИ фиксированных amountUSDC / amountETH
+//  • Multi-Quoter по комиссиям 500, 2500, 3000, 10000
+//  • Quoter через staticCall, fallback если нет котировок
+//  • /diag + POST / (root)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -15,46 +19,31 @@ import {
 const PORT = process.env.PORT || 10000;
 
 const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
-const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY  || "").trim();
+const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY   || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-// 90% баланса
-const PERCENT_TO_SWAP = BigInt(
-  Number.isFinite(parseInt(process.env.PERCENT_TO_SWAP || "90", 10))
-    ? parseInt(process.env.PERCENT_TO_SWAP || "90", 10)
-    : 90
-);
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));  // 90% по умолчанию
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS    || "100", 10)); // 100 = 1%
+const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-// slippage, в bps (100 = 1%)
-const SLIPPAGE_BPS = BigInt(
-  Number.isFinite(parseInt(process.env.SLIPPAGE_BPS || "100", 10))
-    ? parseInt(process.env.SLIPPAGE_BPS || "100", 10)
-    : 100
-);
+const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
 
-// DRY_RUN полностью под контролем env
-const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
-
-// QuoterV2 адрес задаётся только из env, чтобы не угадывать
-const QUOTER_ADDRESS = (process.env.QUOTER_ADDRESS || "").trim();
-
-// Белый список кошельков
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// несколько возможных пулов USDC/WETH, выбираем лучший
-const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
+// Пулы USDC/WETH — обязательно включаем 0.25% = 2500, как на твоём скрине Uniswap
+const POOL_FEES = [500, 2500, 3000, 10000];
 
 // ========== СЕТЬ / АДРЕСА ==========
 
 const CHAIN_ID_BASE = 8453;
 
-// официальные адреса на Base
-const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // native USDC
-const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006"; // WETH
-const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481"; // SwapRouter02
+// Официальные адреса на Base
+const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
+const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481";
 
 // ========== ABI ==========
 
@@ -78,11 +67,13 @@ const SWAP_ROUTER_ABI = [
   ") params) external payable returns (uint256 amountOut)"
 ];
 
+// Для чтения баланса и unWrap WETH -> ETH
 const WETH_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function withdraw(uint256 wad) public"
 ];
 
+// Quoter V2 (Base)
 const QUOTER_ABI = [
   "function quoteExactInputSingle(" +
     "address tokenIn," +
@@ -101,9 +92,7 @@ const QUOTER_ABI = [
 // ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
 
 function getProvider() {
-  if (!RPC_URL_BASE) {
-    throw new Error("RPC_URL_BASE is not set");
-  }
+  if (!RPC_URL_BASE) throw new Error("RPC_URL_BASE is not set");
   return new JsonRpcProvider(RPC_URL_BASE, CHAIN_ID_BASE);
 }
 
@@ -144,14 +133,25 @@ async function getNinetyPercentEth(wallet) {
 // ========== MULTI-QUOTER: выбор лучшего пула ==========
 
 async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
-  if (!QUOTER_ADDRESS) throw new Error("QUOTER_ADDRESS is not set");
+  if (!QUOTER_ADDRESS) {
+    console.warn("No QUOTER_ADDRESS -> fallback, amountOutMinimum = 0");
+    return {
+      poolFee: POOL_FEES[0],
+      amountOut: 0n,
+      amountOutMinimum: 0n,
+      allQuotes: [],
+      usedFallback: true
+    };
+  }
+
   if (amountIn <= 0n) throw new Error("AmountIn must be > 0");
 
   const quotes = [];
 
   for (const fee of POOL_FEES) {
     try {
-      const [amountOut] = await quoter.quoteExactInputSingle(
+      // Важно: staticCall (ethers v6)
+      const [amountOut] = await quoter.quoteExactInputSingle.staticCall(
         tokenIn,
         tokenOut,
         amountIn,
@@ -162,18 +162,25 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
         quotes.push({ fee, amountOut });
       }
     } catch (e) {
-      console.warn("Quoter fee failed", fee, e.message);
+      console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
     }
   }
 
   if (!quotes.length) {
-    throw new Error("No valid pool quotes for this token pair/amount");
+    console.warn("No valid pool quotes, using fallback amountOutMinimum = 0");
+    return {
+      poolFee: POOL_FEES[0],
+      amountOut: 0n,
+      amountOutMinimum: 0n,
+      allQuotes: [],
+      usedFallback: true
+    };
   }
 
-  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1));
+  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1)); // лучший = max amountOut
   const best = quotes[0];
 
-  const slippageFactor = 10000n - SLIPPAGE_BPS;
+  const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 100 = 9900 (1% slippage)
   const minOut = (best.amountOut * slippageFactor) / 10000n;
   if (minOut <= 0n) throw new Error("Computed amountOutMinimum is zero");
 
@@ -184,24 +191,42 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
     allQuotes: quotes.map(q => ({
       fee: q.fee,
       amountOut: q.amountOut.toString()
-    }))
+    })),
+    usedFallback: false
   };
 }
 
 // ========== SWAP-ФУНКЦИИ ==========
 
-// USDC -> ETH (через WETH + unwrap)
-async function swapUsdcToEth(wallet) {
+// USDC -> ETH (через WETH + unwrap), поддерживает:
+//  • либо fixedAmountUSDC (в wei USDC),
+//  • либо 90% баланса, если fixedAmountUSDC не задан.
+async function swapUsdcToEth(wallet, opts = {}) {
   const provider = wallet.provider;
 
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
   const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = QUOTER_ADDRESS
+    ? new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider)
+    : null;
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentUsdc(wallet, usdc);
+  let usdcBalance;
+  let amountIn;
+
+  if (opts.fixedAmountUSDC && opts.fixedAmountUSDC > 0n) {
+    usdcBalance = await usdc.balanceOf(wallet.address);
+    amountIn = opts.fixedAmountUSDC;
+    if (usdcBalance < amountIn) {
+      throw new Error("Not enough USDC balance for requested amount");
+    }
+  } else {
+    const r = await getNinetyPercentUsdc(wallet, usdc);
+    usdcBalance = r.balance;
+    amountIn = r.amount;
+  }
 
   const allowance = await usdc.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
@@ -209,14 +234,10 @@ async function swapUsdcToEth(wallet) {
     await approveTx.wait();
   }
 
-  const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
-    quoter,
-    USDC_ADDRESS,
-    WETH_ADDRESS,
-    amountIn
-  );
+  const { poolFee, amountOut, amountOutMinimum, allQuotes, usedFallback } =
+    await bestQuote(quoter, USDC_ADDRESS, WETH_ADDRESS, amountIn);
 
-  const deadline = Math.floor(Date.now() / 1000) + 600;
+  const deadline = Math.floor(Date.now() / 1000) + 600; // 10 минут
 
   const params = {
     tokenIn: USDC_ADDRESS,
@@ -239,7 +260,8 @@ async function swapUsdcToEth(wallet) {
       usdcBalance: usdcBalance.toString(),
       usdcBalanceHuman: formatUnits(usdcBalance, usdcDecimals),
       chosenPoolFee: poolFee,
-      poolQuotes: allQuotes
+      poolQuotes: allQuotes,
+      usedFallback
     };
   }
 
@@ -264,6 +286,7 @@ async function swapUsdcToEth(wallet) {
     quotedAmountOut: amountOut.toString(),
     chosenPoolFee: poolFee,
     poolQuotes: allQuotes,
+    usedFallback,
     usdcBalanceBefore: usdcBalance.toString(),
     usdcBalanceBeforeHuman: formatUnits(usdcBalance, usdcDecimals),
     wethUnwrapped: wethBalance.toString(),
@@ -271,21 +294,34 @@ async function swapUsdcToEth(wallet) {
   };
 }
 
-// ETH -> USDC (ETH -> WETH внутри Router)
-async function swapEthToUsdc(wallet) {
+// ETH -> USDC (ETH -> WETH внутри Router), аналогично:
+//  • fixedAmountWei (если указан),
+//  • иначе 90% баланса.
+async function swapEthToUsdc(wallet, opts = {}) {
   const provider = wallet.provider;
 
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = QUOTER_ADDRESS
+    ? new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider)
+    : null;
 
-  const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
+  let ethBalance;
+  let amountIn;
 
-  const { poolFee, amountOut, amountOutMinimum, allQuotes } = await bestQuote(
-    quoter,
-    WETH_ADDRESS,
-    USDC_ADDRESS,
-    amountIn
-  );
+  if (opts.fixedAmountWei && opts.fixedAmountWei > 0n) {
+    ethBalance = await provider.getBalance(wallet.address);
+    amountIn = opts.fixedAmountWei;
+    if (ethBalance < amountIn) {
+      throw new Error("Not enough ETH balance for requested amount");
+    }
+  } else {
+    const r = await getNinetyPercentEth(wallet);
+    ethBalance = r.balance;
+    amountIn = r.amount;
+  }
+
+  const { poolFee, amountOut, amountOutMinimum, allQuotes, usedFallback } =
+    await bestQuote(quoter, WETH_ADDRESS, USDC_ADDRESS, amountIn);
 
   const deadline = Math.floor(Date.now() / 1000) + 600;
 
@@ -310,7 +346,8 @@ async function swapEthToUsdc(wallet) {
       ethBalance: ethBalance.toString(),
       ethBalanceHuman: formatUnits(ethBalance, 18),
       chosenPoolFee: poolFee,
-      poolQuotes: allQuotes
+      poolQuotes: allQuotes,
+      usedFallback
     };
   }
 
@@ -327,6 +364,7 @@ async function swapEthToUsdc(wallet) {
     quotedAmountOut: amountOut.toString(),
     chosenPoolFee: poolFee,
     poolQuotes: allQuotes,
+    usedFallback,
     ethBalanceBefore: ethBalance.toString(),
     ethBalanceBeforeHuman: formatUnits(ethBalance, 18)
   };
@@ -342,6 +380,7 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
 });
 
+// Расширенный /diag
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider();
@@ -370,13 +409,13 @@ app.get("/diag", async (_req, res) => {
         usdc.allowance(address, SWAP_ROUTER_ADDRESS)
       ]);
 
-      usdcDecimals       = Number(dec);
-      usdcRaw            = usdcBal.toString();
-      usdcHuman          = formatUnits(usdcBal, usdcDecimals);
-      wethRaw            = wethBal.toString();
-      wethHuman          = formatUnits(wethBal, 18);
-      usdcAllowanceRaw   = allowance.toString();
-      usdcAllowanceOk    = allowance > 0n;
+      usdcDecimals = Number(dec);
+      usdcRaw   = usdcBal.toString();
+      usdcHuman = formatUnits(usdcBal, usdcDecimals);
+      wethRaw   = wethBal.toString();
+      wethHuman = formatUnits(wethBal, 18);
+      usdcAllowanceRaw = allowance.toString();
+      usdcAllowanceOk  = allowance > 0n;
     } catch (e) {
       diagError = e.message;
     }
@@ -427,7 +466,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// приёмник сигналов TradingView
+// Основной приёмник сигналов TradingView / ручных curl
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
@@ -462,11 +501,34 @@ app.post("/", async (req, res) => {
 
     const side = String(p.side || "").toUpperCase();
 
+    // Опциональные параметры:
+    // amountUSDC — число в обычных единицах (например 7.5)
+    // amountETH  — число в обычных ETH (например 0.002)
+    let fixedAmountUSDC = null;
+    if (p.amountUSDC != null) {
+      const num = Number(p.amountUSDC);
+      if (!Number.isFinite(num) || num <= 0) {
+        throw new Error("amountUSDC must be a positive number");
+      }
+      fixedAmountUSDC = BigInt(Math.round(num * 1e6)); // USDC 6 decimals
+    }
+
+    let fixedAmountWei = null;
+    if (p.amountETH != null) {
+      const num = Number(p.amountETH);
+      if (!Number.isFinite(num) || num <= 0) {
+        throw new Error("amountETH must be a positive number");
+      }
+      fixedAmountWei = BigInt(Math.round(num * 1e18));
+    }
+
     let result;
     if (side === "BUY") {
-      result = await swapUsdcToEth(wallet);
+      // USDC -> ETH
+      result = await swapUsdcToEth(wallet, { fixedAmountUSDC });
     } else if (side === "SELL") {
-      result = await swapEthToUsdc(wallet);
+      // ETH -> USDC
+      result = await swapEthToUsdc(wallet, { fixedAmountWei });
     } else {
       throw new Error(`Unknown side: ${p.side}`);
     }
@@ -486,7 +548,7 @@ app.post("/", async (req, res) => {
 // ========== START ==========
 
 app.listen(PORT, () => {
-  console.log(`tv-webhookl started on port ${PORT}`);
+  console.log("tv-webhookl started on port", PORT);
   console.log("ENV check:", {
     DRY_RUN,
     RPC_URL_BASE: RPC_URL_BASE ? RPC_URL_BASE.slice(0, 48) + "..." : null,
