@@ -29,9 +29,10 @@ const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// несколько возможных пулов USDC/WETH, будем выбирать лучший
-// важно: на Base активно используется пул с комиссией 0.25% (fee = 2500)
-const POOL_FEES = [500, 2500, 3000, 10000]; // 0.05%, 0.25%, 0.3%, 1%
+// несколько возможных пулов USDC/WETH, будем выбирать лучший (если Quoter работает)
+const POOL_FEES = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
+// базовый фи для fallback, когда котировок нет
+const DEFAULT_POOL_FEE = 500;
 
 // ========== СЕТЬ / АДРЕСА ==========
 
@@ -69,8 +70,7 @@ const WETH_ABI = [
   "function withdraw(uint256 wad) public"
 ];
 
-// В on-chain контракте функция не view, но нас это не волнует —
-// нам нужен именно eth_call, поэтому объявляем её как view.
+// В on-chain контракте функция не view, но для eth_call объявляем её как view.
 const QUOTER_ABI = [
   "function quoteExactInputSingle(" +
     "address tokenIn," +
@@ -132,36 +132,43 @@ async function getNinetyPercentEth(wallet) {
 // ========== MULTI-QUOTER: выбор лучшего пула ==========
 
 async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
-  if (!QUOTER_ADDRESS) throw new Error("QUOTER_ADDRESS is not set");
   if (amountIn <= 0n) throw new Error("AmountIn must be > 0");
 
   const quotes = [];
+  let quoterTried = false;
 
-  // Пытаемся получить котировку по каждому fee tier.
-  for (const fee of POOL_FEES) {
-    try {
-      // через staticCall гарантированно делаем eth_call
-      const fn = quoter.getFunction("quoteExactInputSingle");
-      const [amountOut] = await fn.staticCall(tokenIn, tokenOut, amountIn, fee, 0n);
+  if (QUOTER_ADDRESS) {
+    for (const fee of POOL_FEES) {
+      try {
+        quoterTried = true;
+        const fn = quoter.getFunction("quoteExactInputSingle");
+        const [amountOut] = await fn.staticCall(tokenIn, tokenOut, amountIn, fee, 0n);
 
-      if (amountOut > 0n) {
-        quotes.push({ fee, amountOut });
+        if (amountOut > 0n) {
+          quotes.push({ fee, amountOut });
+        }
+      } catch (e) {
+        console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
       }
-    } catch (e) {
-      console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
     }
+  } else {
+    console.warn("No QUOTER_ADDRESS set, skipping quotes and using fallback");
   }
 
   if (quotes.length === 0) {
-    // Нет ни одной валидной котировки — это как раз тот случай, который у тебя вызывал
-    // "No valid pool quotes" и потом revert в роутере.
-    // Делаем fallback: используем наиболее вероятный пул 0.25% (2500) и minOut = 0.
-    console.warn("No valid pool quotes, using fallback amountOutMinimum = 0");
+    // Quoter ничего внятного не дал — идём по fallback: используем самый ликвидный пул 0.05% (500)
+    console.warn(
+      "No valid pool quotes, using fallback fee %d and amountOutMinimum = 0",
+      DEFAULT_POOL_FEE
+    );
     return {
-      poolFee: 2500,
+      poolFee: DEFAULT_POOL_FEE,
       amountOut: 0n,
       amountOutMinimum: 0n,
-      allQuotes: [],
+      allQuotes: quotes.map(q => ({
+        fee: q.fee,
+        amountOut: q.amountOut.toString()
+      })),
       usedFallback: true
     };
   }
@@ -195,7 +202,7 @@ async function swapUsdcToEth(wallet) {
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
   const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = new Contract(QUOTER_ADDRESS || USDC_ADDRESS, QUOTER_ABI, provider); // если QUOTER пустой, объект всё равно нужен
 
   const usdcDecimals = await usdc.decimals();
 
@@ -277,7 +284,7 @@ async function swapEthToUsdc(wallet) {
   const provider = wallet.provider;
 
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
+  const quoter = new Contract(QUOTER_ADDRESS || USDC_ADDRESS, QUOTER_ABI, provider);
 
   const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
 
@@ -381,7 +388,7 @@ app.get("/diag", async (_req, res) => {
       wethRaw           = wethBal.toString();
       wethHuman         = formatUnits(wethBal, 18);
       usdcAllowanceRaw  = allowance.toString();
-      usdcAllowanceOk   = allowance > 0n;
+      usdcAllowanceOk   = allowance >= ((usdcBal * PERCENT_TO_SWAP) / 100n);
     } catch (e) {
       diagError = e.message;
     }
@@ -425,6 +432,7 @@ app.get("/diag", async (_req, res) => {
       },
 
       poolFees: POOL_FEES,
+      defaultPoolFee: DEFAULT_POOL_FEE,
 
       tokenDiagError: diagError
     });
@@ -502,6 +510,7 @@ app.listen(PORT, () => {
     PERCENT_TO_SWAP: PERCENT_TO_SWAP.toString(),
     SLIPPAGE_BPS: SLIPPAGE_BPS.toString(),
     POOL_FEES,
+    DEFAULT_POOL_FEE,
     WALLET_WHITELIST_SIZE: WALLET_WHITELIST.length
   });
 });
