@@ -1,4 +1,4 @@
-// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->WETH, 90% баланса, multi-Quoter, расширенный /diag
+// index.js — Uniswap v3 SwapRouter02 на Base, USDC<->ETH, 90% баланса, multi-Quoter, расширенный /diag
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -18,22 +18,20 @@ const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-// 90% баланса
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));
-
-// Slippage по умолчанию 0.5% (50 bps). Можно задать 30 (=0.3%) или другое в ENV.
-const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "50", 10));
-
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));  // 90% баланса
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "50", 10));     // 50 = 0.5%
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
+// правильный QuoterV2 на Base
+const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "0x8dB5A325dC44E5aE52F57380E9A2b8F8B7f44cD7").trim();
 
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Пулы USDC/WETH, которые будем пробовать (только те, которые ты просил)
+// несколько возможных пулов USDC/WETH, будем выбирать лучший
+// на Base основная ликвидность в 0.05% и 0.25% пулах
 const POOL_FEES = [500, 2500]; // 0.05%, 0.25%
 
 // ========== СЕТЬ / АДРЕСА ==========
@@ -43,7 +41,7 @@ const CHAIN_ID_BASE = 8453;
 // официальные адреса на Base
 const USDC_ADDRESS        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // нативный USDC
 const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
-const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481"; // Uniswap v3 SwapRouter02 Base
+const SWAP_ROUTER_ADDRESS = "0x2626664c2603336E57B271c5C0b26F421741e481"; // Uniswap v3 SwapRouter02 на Base
 
 // ========== ABI ==========
 
@@ -68,10 +66,11 @@ const SWAP_ROUTER_ABI = [
 ];
 
 const WETH_ABI = [
-  "function balanceOf(address owner) view returns (uint256)"
+  "function balanceOf(address owner) view returns (uint256)",
+  "function withdraw(uint256 wad) public"
 ];
 
-// QuoterV2: объявляем как view, чтобы форсировать eth_call
+// В on-chain контракте функция не view, но нам нужен eth_call, объявляем как view
 const QUOTER_ABI = [
   "function quoteExactInputSingle(" +
     "address tokenIn," +
@@ -121,12 +120,12 @@ async function getNinetyPercentUsdc(wallet, usdc) {
   return { balance: bal, amount };
 }
 
-// 90% баланса WETH
-async function getNinetyPercentWeth(wallet, weth) {
-  const bal = await weth.balanceOf(wallet.address);
-  if (bal === 0n) throw new Error("WETH balance is zero");
+// 90% баланса native ETH
+async function getNinetyPercentEth(wallet) {
+  const bal = await wallet.provider.getBalance(wallet.address);
+  if (bal === 0n) throw new Error("ETH balance is zero");
   const amount = (bal * PERCENT_TO_SWAP) / 100n;
-  if (amount <= 0n) throw new Error("WETH amount to swap is zero");
+  if (amount <= 0n) throw new Error("ETH amount to swap is zero");
   return { balance: bal, amount };
 }
 
@@ -140,13 +139,9 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
 
   for (const fee of POOL_FEES) {
     try {
-      const [amountOut] = await quoter.quoteExactInputSingle(
-        tokenIn,
-        tokenOut,
-        amountIn,
-        fee,
-        0n
-      );
+      const fn = quoter.getFunction("quoteExactInputSingle");
+      const [amountOut] = await fn.staticCall(tokenIn, tokenOut, amountIn, fee, 0n);
+
       if (amountOut > 0n) {
         quotes.push({ fee, amountOut });
       }
@@ -186,17 +181,9 @@ async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
 }
 
 // ========== SWAP-ФУНКЦИИ ==========
-//
-// ВАЖНО: теперь работаем строго USDC<->WETH.
-//
-// BUY  = USDC -> WETH (90% от баланса USDC)
-// SELL = WETH -> USDC (90% от баланса WETH)
-//
-// ETH в портфеле = газ, а не трейдабельный актив.
-// Если у тебя 0 WETH, SELL просто вернёт ошибку "WETH balance is zero".
 
-// USDC -> WETH
-async function swapUsdcToWeth(wallet) {
+// USDC -> ETH (через WETH + unwrap)
+async function swapUsdcToEth(wallet) {
   const provider = wallet.provider;
 
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
@@ -238,7 +225,7 @@ async function swapUsdcToWeth(wallet) {
   if (DRY_RUN) {
     return {
       mode: "dry-run",
-      direction: "USDC_TO_WETH",
+      direction: "USDC_TO_ETH",
       amountIn: amountIn.toString(),
       amountOut: amountOut.toString(),
       amountOutMinimum: amountOutMinimum.toString(),
@@ -253,11 +240,17 @@ async function swapUsdcToWeth(wallet) {
   const tx = await router.exactInputSingle(params, { value: 0n });
   const receipt = await tx.wait();
 
-  const wethAfter = await weth.balanceOf(wallet.address);
+  const wethBalance = await weth.balanceOf(wallet.address);
+  let unwrapHash = null;
+  if (wethBalance > 0n) {
+    const unwrapTx = await weth.withdraw(wethBalance);
+    await unwrapTx.wait();
+    unwrapHash = unwrapTx.hash;
+  }
 
   return {
     mode: "live",
-    direction: "USDC_TO_WETH",
+    direction: "USDC_TO_ETH",
     txHash: tx.hash,
     blockNumber: receipt.blockNumber,
     amountIn: amountIn.toString(),
@@ -268,22 +261,19 @@ async function swapUsdcToWeth(wallet) {
     usedFallback,
     usdcBalanceBefore: usdcBalance.toString(),
     usdcBalanceBeforeHuman: formatUnits(usdcBalance, usdcDecimals),
-    wethBalanceAfter: wethAfter.toString()
+    wethUnwrapped: wethBalance.toString(),
+    unwrapTxHash: unwrapHash
   };
 }
 
-// WETH -> USDC
-async function swapWethToUsdc(wallet) {
+// ETH -> USDC (ETH -> WETH внутри Router)
+async function swapEthToUsdc(wallet) {
   const provider = wallet.provider;
 
-  const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
-  const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
   const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
-  const usdcDecimals = await usdc.decimals();
-
-  const { balance: wethBalance, amount: amountIn } = await getNinetyPercentWeth(wallet, weth);
+  const { balance: ethBalance, amount: amountIn } = await getNinetyPercentEth(wallet);
 
   const {
     poolFee,
@@ -309,26 +299,24 @@ async function swapWethToUsdc(wallet) {
   if (DRY_RUN) {
     return {
       mode: "dry-run",
-      direction: "WETH_TO_USDC",
+      direction: "ETH_TO_USDC",
       amountIn: amountIn.toString(),
       amountOut: amountOut.toString(),
       amountOutMinimum: amountOutMinimum.toString(),
-      wethBalance: wethBalance.toString(),
-      wethBalanceHuman: formatUnits(wethBalance, 18),
+      ethBalance: ethBalance.toString(),
+      ethBalanceHuman: formatUnits(ethBalance, 18),
       chosenPoolFee: poolFee,
       poolQuotes: allQuotes,
       usedFallback
     };
   }
 
-  const tx = await router.exactInputSingle(params, { value: 0n });
+  const tx = await router.exactInputSingle(params, { value: amountIn });
   const receipt = await tx.wait();
-
-  const usdcAfter = await usdc.balanceOf(wallet.address);
 
   return {
     mode: "live",
-    direction: "WETH_TO_USDC",
+    direction: "ETH_TO_USDC",
     txHash: tx.hash,
     blockNumber: receipt.blockNumber,
     amountIn: amountIn.toString(),
@@ -337,10 +325,8 @@ async function swapWethToUsdc(wallet) {
     chosenPoolFee: poolFee,
     poolQuotes: allQuotes,
     usedFallback,
-    wethBalanceBefore: wethBalance.toString(),
-    wethBalanceBeforeHuman: formatUnits(wethBalance, 18),
-    usdcBalanceAfter: usdcAfter.toString(),
-    usdcBalanceAfterHuman: formatUnits(usdcAfter, usdcDecimals)
+    ethBalanceBefore: ethBalance.toString(),
+    ethBalanceBeforeHuman: formatUnits(ethBalance, 18)
   };
 }
 
@@ -369,7 +355,8 @@ app.get("/diag", async (_req, res) => {
     let wethHuman = null;
     let usdcAllowanceRaw = null;
     let usdcAllowanceOk = null;
-    let usdcDecimals = 6;
+    let usdcDecimals =
+      6;
     let diagError = null;
 
     try {
@@ -401,7 +388,7 @@ app.get("/diag", async (_req, res) => {
     const ethHuman = formatUnits(baseBalance, 18);
 
     const canBuy  = usdcRaw !== null && BigInt(usdcRaw) > 0n;
-    const canSell = wethRaw !== null && BigInt(wethRaw) > 0n; // SELL теперь зависит от WETH
+    const canSell = baseBalance > 0n;
 
     res.json({
       ok: true,
@@ -429,7 +416,7 @@ app.get("/diag", async (_req, res) => {
 
       directions: {
         canBuy_USDC_to_WETH: canBuy,
-        canSell_WETH_to_USDC: canSell
+        canSell_WETH_to_USDC: false
       },
 
       poolFees: POOL_FEES,
@@ -478,11 +465,9 @@ app.post("/", async (req, res) => {
 
     let result;
     if (side === "BUY") {
-      // BUY: USDC -> WETH
-      result = await swapUsdcToWeth(wallet);
+      result = await swapUsdcToEth(wallet);
     } else if (side === "SELL") {
-      // SELL: WETH -> USDC
-      result = await swapWethToUsdc(wallet);
+      result = await swapEthToUsdc(wallet);
     } else {
       throw new Error(`Unknown side: ${p.side}`);
     }
