@@ -1,4 +1,5 @@
-// index.js — Uniswap v3 SwapRouter на Base, USDC <-> WETH, 90% баланса
+// index.js — упрощённый рабочий вариант
+// Base mainnet, Uniswap v3 SwapRouter02, 90% баланса USDC <-> WETH
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -18,28 +19,26 @@ const RPC_URL_BASE    = (process.env.RPC_URL_BASE || "").trim();
 const PRIVATE_KEY_RAW = (process.env.PRIVATE_KEY || "").trim();
 const SHARED_SECRET   = (process.env.SHARED_SECRET || "").trim();
 
-const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10));  // 90%
-const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "50", 10));     // 0.5%
+const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10)); // 90%
+const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "50", 10));   // сейчас не используется
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
-
-const QUOTER_ADDRESS  = (process.env.QUOTER_ADDRESS || "").trim();
 
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
   .split(",")
-  .map((s) => s.trim().toLowerCase())
+  .map(s => s.trim().toLowerCase())
   .filter(Boolean);
-
-// Пулы USDC/WETH, которые пробуем
-const POOL_FEES = [500, 2500]; // 0.05%, 0.25%
 
 // ========== СЕТЬ / АДРЕСА ==========
 
 const CHAIN_ID_BASE = 8453;
 
-// ВАЖНО: все адреса приведены к нижнему регистру, чтобы не было ошибок checksum
+// все адреса — strictly lowercase, чтобы не было "bad address checksum"
 const USDC_ADDRESS        = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
 const SWAP_ROUTER_ADDRESS = "0x2626664c2603336e57b271c5c0b26f421741e481";
+
+// единственный fee-tier, который используем (USDC/WETH на Base)
+const DEFAULT_POOL_FEE = 500; // 0.05%
 
 // ========== ABI ==========
 
@@ -63,23 +62,14 @@ const SWAP_ROUTER_ABI = [
   ") params) external payable returns (uint256 amountOut)"
 ];
 
-// Стандартный Uniswap v3 Quoter: один uint256 в ответе
-const QUOTER_ABI = [
-  "function quoteExactInputSingle(" +
-    "address tokenIn," +
-    "address tokenOut," +
-    "uint24 fee," +
-    "uint256 amountIn," +
-    "uint160 sqrtPriceLimitX96" +
-  ") external returns (uint256 amountOut)"
+const WETH_ABI = [
+  "function balanceOf(address owner) view returns (uint256)"
 ];
 
 // ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
 
 function getProvider() {
-  if (!RPC_URL_BASE) {
-    throw new Error("RPC_URL_BASE is not set");
-  }
+  if (!RPC_URL_BASE) throw new Error("RPC_URL_BASE is not set");
   return new JsonRpcProvider(RPC_URL_BASE, CHAIN_ID_BASE);
 }
 
@@ -101,214 +91,151 @@ function normalizeBody(raw) {
   return { _raw: raw };
 }
 
-async function getNinetyPercentErc20(contract, owner) {
-  const bal = await contract.balanceOf(owner);
+async function getNinetyPercentToken(contract, walletAddress) {
+  const bal = await contract.balanceOf(walletAddress);
   if (bal === 0n) throw new Error("Token balance is zero");
   const amount = (bal * PERCENT_TO_SWAP) / 100n;
   if (amount <= 0n) throw new Error("Token amount to swap is zero");
   return { balance: bal, amount };
 }
 
-// ========== MULTI-QUOTER ==========
-
-async function bestQuote(quoter, tokenIn, tokenOut, amountIn) {
-  if (!QUOTER_ADDRESS) throw new Error("QUOTER_ADDRESS is not set");
-  if (amountIn <= 0n) throw new Error("AmountIn must be > 0");
-
-  const quotes = [];
-  const fn = quoter.getFunction("quoteExactInputSingle");
-
-  for (const fee of POOL_FEES) {
-    try {
-      const [amountOut] = await fn.staticCall(
-        tokenIn,
-        tokenOut,
-        fee,
-        amountIn,
-        0n
-      );
-
-      if (amountOut > 0n) {
-        quotes.push({ fee, amountOut });
-      }
-    } catch (e) {
-      console.warn("Quoter fee failed", fee, e.shortMessage || e.message);
-    }
-  }
-
-  if (quotes.length === 0) {
-    throw new Error("No valid pool quotes for this pair, aborting swap");
-  }
-
-  quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : 1));
-  const best = quotes[0];
-
-  const slippageFactor = 10000n - SLIPPAGE_BPS; // 10000 - 50 = 9950 (0.5%)
-  const minOut = (best.amountOut * slippageFactor) / 10000n;
-  if (minOut <= 0n) throw new Error("Computed amountOutMinimum is zero");
-
-  return {
-    poolFee: best.fee,
-    amountOut: best.amountOut,
-    amountOutMinimum: minOut,
-    allQuotes: quotes.map((q) => ({
-      fee: q.fee,
-      amountOut: q.amountOut.toString()
-    }))
-  };
-}
-
-// ========== SWAP-ФУНКЦИИ ==========
+// ========== SWAP-ФУНКЦИИ (без квотера) ==========
 
 // USDC -> WETH
 async function swapUsdcToWeth(wallet) {
   const provider = wallet.provider;
+  const address  = await wallet.getAddress();
 
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
-  const weth   = new Contract(WETH_ADDRESS, ERC20_ABI, wallet);
+  const weth   = new Contract(WETH_ADDRESS, WETH_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: usdcBalance, amount: amountIn } =
-    await getNinetyPercentErc20(usdc, wallet.address);
+  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentToken(usdc, address);
 
-  const allowance = await usdc.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
+  const allowance = await usdc.allowance(address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
     const approveTx = await usdc.approve(SWAP_ROUTER_ADDRESS, MaxUint256);
     await approveTx.wait();
   }
 
-  const {
-    poolFee,
-    amountOut,
-    amountOutMinimum,
-    allQuotes
-  } = await bestQuote(quoter, USDC_ADDRESS, WETH_ADDRESS, amountIn);
-
-  const deadline = Math.floor(Date.now() / 1000) + 600;
+  const deadline = Math.floor(Date.now() / 1000) + 600; // 10 минут
 
   const params = {
     tokenIn: USDC_ADDRESS,
     tokenOut: WETH_ADDRESS,
-    fee: poolFee,
-    recipient: wallet.address,
+    fee: DEFAULT_POOL_FEE,
+    recipient: address,
     deadline,
     amountIn,
-    amountOutMinimum,
+    amountOutMinimum: 0n, // без квотера не считаем slippage
     sqrtPriceLimitX96: 0n
   };
 
   if (DRY_RUN) {
+    const ethBal = await provider.getBalance(address);
+    const wethBal = await weth.balanceOf(address);
+
     return {
       mode: "dry-run",
       direction: "USDC_TO_WETH",
+      router: SWAP_ROUTER_ADDRESS,
+      poolFee: DEFAULT_POOL_FEE,
       amountIn: amountIn.toString(),
-      amountOut: amountOut.toString(),
-      amountOutMinimum: amountOutMinimum.toString(),
+      amountOutMinimum: "0",
       usdcBalance: usdcBalance.toString(),
       usdcBalanceHuman: formatUnits(usdcBalance, usdcDecimals),
-      chosenPoolFee: poolFee,
-      poolQuotes: allQuotes
+      ethBalanceWei: ethBal.toString(),
+      wethBalanceWei: wethBal.toString()
     };
   }
 
   const tx = await router.exactInputSingle(params, { value: 0n });
   const receipt = await tx.wait();
 
-  const wethBalanceAfter = await weth.balanceOf(wallet.address);
+  const wethAfter = await weth.balanceOf(address);
 
   return {
     mode: "live",
     direction: "USDC_TO_WETH",
     txHash: tx.hash,
     blockNumber: receipt.blockNumber,
+    poolFee: DEFAULT_POOL_FEE,
     amountIn: amountIn.toString(),
-    amountOutMinimum: amountOutMinimum.toString(),
-    quotedAmountOut: amountOut.toString(),
-    chosenPoolFee: poolFee,
-    poolQuotes: allQuotes,
+    amountOutMinimum: "0",
+    wethBalanceAfter: wethAfter.toString(),
     usdcBalanceBefore: usdcBalance.toString(),
-    usdcBalanceBeforeHuman: formatUnits(usdcBalance, usdcDecimals),
-    wethBalanceAfter: wethBalanceAfter.toString(),
-    wethBalanceAfterHuman: formatUnits(wethBalanceAfter, 18)
+    usdcBalanceBeforeHuman: formatUnits(usdcBalance, usdcDecimals)
   };
 }
 
 // WETH -> USDC
 async function swapWethToUsdc(wallet) {
   const provider = wallet.provider;
+  const address  = await wallet.getAddress();
 
-  const weth   = new Contract(WETH_ADDRESS, ERC20_ABI, wallet);
   const usdc   = new Contract(USDC_ADDRESS, ERC20_ABI, wallet);
+  const weth   = new Contract(WETH_ADDRESS, ERC20_ABI, wallet);
   const router = new Contract(SWAP_ROUTER_ADDRESS, SWAP_ROUTER_ABI, wallet);
-  const quoter = new Contract(QUOTER_ADDRESS, QUOTER_ABI, provider);
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: wethBalance, amount: amountIn } =
-    await getNinetyPercentErc20(weth, wallet.address);
+  const { balance: wethBalance, amount: amountIn } = await getNinetyPercentToken(weth, address);
 
-  const allowance = await weth.allowance(wallet.address, SWAP_ROUTER_ADDRESS);
+  const allowance = await weth.allowance(address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
     const approveTx = await weth.approve(SWAP_ROUTER_ADDRESS, MaxUint256);
     await approveTx.wait();
   }
-
-  const {
-    poolFee,
-    amountOut,
-    amountOutMinimum,
-    allQuotes
-  } = await bestQuote(quoter, WETH_ADDRESS, USDC_ADDRESS, amountIn);
 
   const deadline = Math.floor(Date.now() / 1000) + 600;
 
   const params = {
     tokenIn: WETH_ADDRESS,
     tokenOut: USDC_ADDRESS,
-    fee: poolFee,
-    recipient: wallet.address,
+    fee: DEFAULT_POOL_FEE,
+    recipient: address,
     deadline,
     amountIn,
-    amountOutMinimum,
+    amountOutMinimum: 0n,
     sqrtPriceLimitX96: 0n
   };
 
   if (DRY_RUN) {
+    const ethBal  = await provider.getBalance(address);
+    const usdcBal = await usdc.balanceOf(address);
+
     return {
       mode: "dry-run",
       direction: "WETH_TO_USDC",
+      router: SWAP_ROUTER_ADDRESS,
+      poolFee: DEFAULT_POOL_FEE,
       amountIn: amountIn.toString(),
-      amountOut: amountOut.toString(),
-      amountOutMinimum: amountOutMinimum.toString(),
+      amountOutMinimum: "0",
       wethBalance: wethBalance.toString(),
-      wethBalanceHuman: formatUnits(wethBalance, 18),
-      chosenPoolFee: poolFee,
-      poolQuotes: allQuotes
+      ethBalanceWei: ethBal.toString(),
+      usdcBalanceWei: usdcBal.toString(),
+      usdcBalanceHuman: formatUnits(usdcBal, usdcDecimals)
     };
   }
 
   const tx = await router.exactInputSingle(params, { value: 0n });
   const receipt = await tx.wait();
 
-  const usdcBalanceAfter = await usdc.balanceOf(wallet.address);
+  const usdcAfter = await usdc.balanceOf(address);
 
   return {
     mode: "live",
     direction: "WETH_TO_USDC",
     txHash: tx.hash,
     blockNumber: receipt.blockNumber,
+    poolFee: DEFAULT_POOL_FEE,
     amountIn: amountIn.toString(),
-    amountOutMinimum: amountOutMinimum.toString(),
-    quotedAmountOut: amountOut.toString(),
-    chosenPoolFee: poolFee,
-    poolQuotes: allQuotes,
+    amountOutMinimum: "0",
     wethBalanceBefore: wethBalance.toString(),
-    wethBalanceBeforeHuman: formatUnits(wethBalance, 18),
-    usdcBalanceAfter: usdcBalanceAfter.toString(),
-    usdcBalanceAfterHuman: formatUnits(usdcBalanceAfter, usdcDecimals)
+    usdcBalanceAfter: usdcAfter.toString(),
+    usdcBalanceAfterHuman: formatUnits(usdcAfter, usdcDecimals)
   };
 }
 
@@ -322,6 +249,7 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "tv-webhookl", ts: new Date().toISOString() });
 });
 
+// /diag — чтобы быстро видеть балансы и allow
 app.get("/diag", async (_req, res) => {
   try {
     const provider = getProvider();
@@ -336,6 +264,8 @@ app.get("/diag", async (_req, res) => {
     let wethHuman = null;
     let usdcAllowanceRaw = null;
     let usdcAllowanceOk = null;
+    let wethAllowanceRaw = null;
+    let wethAllowanceOk = null;
     let usdcDecimals = 6;
     let diagError = null;
 
@@ -343,11 +273,12 @@ app.get("/diag", async (_req, res) => {
       const usdc = new Contract(USDC_ADDRESS, ERC20_ABI, provider);
       const weth = new Contract(WETH_ADDRESS, ERC20_ABI, provider);
 
-      const [usdcBal, dec, wethBal, allowance] = await Promise.all([
+      const [usdcBal, dec, wethBal, usdcAllow, wethAllow] = await Promise.all([
         usdc.balanceOf(address),
         usdc.decimals(),
         weth.balanceOf(address),
-        usdc.allowance(address, SWAP_ROUTER_ADDRESS)
+        usdc.allowance(address, SWAP_ROUTER_ADDRESS),
+        weth.allowance(address, SWAP_ROUTER_ADDRESS)
       ]);
 
       usdcDecimals      = Number(dec);
@@ -355,8 +286,10 @@ app.get("/diag", async (_req, res) => {
       usdcHuman         = formatUnits(usdcBal, usdcDecimals);
       wethRaw           = wethBal.toString();
       wethHuman         = formatUnits(wethBal, 18);
-      usdcAllowanceRaw  = allowance.toString();
-      usdcAllowanceOk   = allowance > 0n;
+      usdcAllowanceRaw  = usdcAllow.toString();
+      usdcAllowanceOk   = usdcAllow > 0n;
+      wethAllowanceRaw  = wethAllow.toString();
+      wethAllowanceOk   = wethAllow > 0n;
     } catch (e) {
       diagError = e.message;
     }
@@ -375,9 +308,10 @@ app.get("/diag", async (_req, res) => {
       address,
       chainId: CHAIN_ID_BASE,
       DRY_RUN,
-      hasQuoter: !!QUOTER_ADDRESS,
-      whitelisted,
       rpcBaseConfigured: !!RPC_URL_BASE,
+      whitelisted,
+      router: SWAP_ROUTER_ADDRESS,
+      defaultPoolFee: DEFAULT_POOL_FEE,
 
       balances: {
         ethWei: baseBalance.toString(),
@@ -391,15 +325,15 @@ app.get("/diag", async (_req, res) => {
       allowance: {
         router: SWAP_ROUTER_ADDRESS,
         usdcAllowanceWei: usdcAllowanceRaw,
-        usdcAllowanceOk
+        usdcAllowanceOk,
+        wethAllowanceWei: wethAllowanceRaw,
+        wethAllowanceOk
       },
 
       directions: {
         canBuy_USDC_to_WETH: canBuy,
         canSell_WETH_to_USDC: canSell
       },
-
-      poolFees: POOL_FEES,
 
       tokenDiagError: diagError
     });
@@ -408,7 +342,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// Основной приёмник TradingView
+// Основной приёмник сигналов TradingView
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
@@ -470,13 +404,12 @@ app.listen(PORT, () => {
   console.log(`tv-webhookl started on port ${PORT}`);
   console.log("ENV check:", {
     DRY_RUN,
-    RPC_URL_BASE: RPC_URL_BASE ? RPC_URL_BASE.slice(0, 40) + "..." : null,
+    RPC_URL_BASE: RPC_URL_BASE ? RPC_URL_BASE.slice(0, 48) + "..." : null,
     HAS_SHARED_SECRET: !!SHARED_SECRET,
     HAS_PRIVATE_KEY: !!PRIVATE_KEY_RAW,
-    HAS_QUOTER: !!QUOTER_ADDRESS,
     PERCENT_TO_SWAP: PERCENT_TO_SWAP.toString(),
     SLIPPAGE_BPS: SLIPPAGE_BPS.toString(),
-    POOL_FEES,
+    DEFAULT_POOL_FEE,
     WALLET_WHITELIST_SIZE: WALLET_WHITELIST.length
   });
 });
