@@ -23,7 +23,7 @@ const PERCENT_TO_SWAP = BigInt(parseInt(process.env.PERCENT_TO_SWAP || "90", 10)
 const SLIPPAGE_BPS    = BigInt(parseInt(process.env.SLIPPAGE_BPS || "50", 10));   // пока не используем
 const DRY_RUN         = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-// жёсткий лимит газа, чтобы ethers не вызывал eth_estimateGas
+// жесткий лимит газа, чтобы ethers не вызывал eth_estimateGas
 const GAS_LIMIT       = BigInt(parseInt(process.env.GAS_LIMIT || "500000", 10));
 
 const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
@@ -35,12 +35,12 @@ const WALLET_WHITELIST = (process.env.WALLET_WHITELIST || "")
 
 const CHAIN_ID_BASE = 8453;
 
-// все адреса — strictly lowercase
+// все адреса строго в lowercase
 const USDC_ADDRESS        = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const WETH_ADDRESS        = "0x4200000000000000000000000000000000000006";
 const SWAP_ROUTER_ADDRESS = "0x2626664c2603336e57b271c5c0b26f421741e481";
 
-// единственный fee-tier, который используем (USDC/WETH на Base)
+// единственный fee tier, который используем
 const DEFAULT_POOL_FEE = 500; // 0.05%
 
 // ========== ABI ==========
@@ -52,24 +52,26 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)"
 ];
 
+// ВАЖНО: правильный ABI SwapRouter02 exactInputSingle, без deadline
 const SWAP_ROUTER_ABI = [
-  "function exactInputSingle(tuple(" +
-    "address tokenIn," +
-    "address tokenOut," +
-    "uint24 fee," +
-    "address recipient," +
-    "uint256 deadline," +
-    "uint256 amountIn," +
-    "uint256 amountOutMinimum," +
-    "uint160 sqrtPriceLimitX96" +
-  ") params) external payable returns (uint256 amountOut)"
+  "function exactInputSingle(" +
+    "tuple(" +
+      "address tokenIn," +
+      "address tokenOut," +
+      "uint24 fee," +
+      "address recipient," +
+      "uint256 amountIn," +
+      "uint256 amountOutMinimum," +
+      "uint160 sqrtPriceLimitX96" +
+    ") params" +
+  ") external payable returns (uint256 amountOut)"
 ];
 
 const WETH_ABI = [
   "function balanceOf(address owner) view returns (uint256)"
 ];
 
-// ========== БАЗОВЫЕ ХЕЛПЕРЫ ==========
+// ========== HELPERS ==========
 
 function getProvider() {
   if (!RPC_URL_BASE) throw new Error("RPC_URL_BASE is not set");
@@ -102,7 +104,7 @@ async function getNinetyPercentToken(contract, walletAddress) {
   return { balance: bal, amount };
 }
 
-// ========== SWAP-ФУНКЦИИ (без квотера) ==========
+// ========== SWAP-ФУНКЦИИ ==========
 
 // USDC -> WETH
 async function swapUsdcToWeth(wallet) {
@@ -115,7 +117,8 @@ async function swapUsdcToWeth(wallet) {
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: usdcBalance, amount: amountIn } = await getNinetyPercentToken(usdc, address);
+  const { balance: usdcBalance, amount: amountIn } =
+    await getNinetyPercentToken(usdc, address);
 
   const allowance = await usdc.allowance(address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
@@ -123,17 +126,14 @@ async function swapUsdcToWeth(wallet) {
     await approveTx.wait();
   }
 
-  const deadline = Math.floor(Date.now() / 1000) + 600; // 10 минут
-
   const params = {
     tokenIn: USDC_ADDRESS,
     tokenOut: WETH_ADDRESS,
     fee: DEFAULT_POOL_FEE,
     recipient: address,
-    deadline,
     amountIn,
-    amountOutMinimum: 0n, // без квотера не считаем slippage
-    sqrtPriceLimitX96: 0n
+    amountOutMinimum: 0n,        // без квотера не считаем slippage
+    sqrtPriceLimitX96: 0n        // без ограничения цены
   };
 
   if (DRY_RUN) {
@@ -154,8 +154,10 @@ async function swapUsdcToWeth(wallet) {
     };
   }
 
-  // ВАЖНО: передаём gasLimit, чтобы не было eth_estimateGas
-  const tx = await router.exactInputSingle(params, { value: 0n, gasLimit: GAS_LIMIT });
+  const tx = await router.exactInputSingle(params, {
+    value: 0n,
+    gasLimit: GAS_LIMIT
+  });
   const receipt = await tx.wait();
 
   const wethAfter = await weth.balanceOf(address);
@@ -185,7 +187,8 @@ async function swapWethToUsdc(wallet) {
 
   const usdcDecimals = await usdc.decimals();
 
-  const { balance: wethBalance, amount: amountIn } = await getNinetyPercentToken(weth, address);
+  const { balance: wethBalance, amount: amountIn } =
+    await getNinetyPercentToken(weth, address);
 
   const allowance = await weth.allowance(address, SWAP_ROUTER_ADDRESS);
   if (!DRY_RUN && allowance < amountIn) {
@@ -193,14 +196,11 @@ async function swapWethToUsdc(wallet) {
     await approveTx.wait();
   }
 
-  const deadline = Math.floor(Date.now() / 1000) + 600;
-
   const params = {
     tokenIn: WETH_ADDRESS,
     tokenOut: USDC_ADDRESS,
     fee: DEFAULT_POOL_FEE,
     recipient: address,
-    deadline,
     amountIn,
     amountOutMinimum: 0n,
     sqrtPriceLimitX96: 0n
@@ -224,7 +224,10 @@ async function swapWethToUsdc(wallet) {
     };
   }
 
-  const tx = await router.exactInputSingle(params, { value: 0n, gasLimit: GAS_LIMIT });
+  const tx = await router.exactInputSingle(params, {
+    value: 0n,
+    gasLimit: GAS_LIMIT
+  });
   const receipt = await tx.wait();
 
   const usdcAfter = await usdc.balanceOf(address);
@@ -346,7 +349,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// Основной приёмник сигналов TradingView
+// Основной приемник сигналов TradingView
 app.post("/", async (req, res) => {
   try {
     const body = normalizeBody(req.body) || {};
